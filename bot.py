@@ -42,6 +42,7 @@ ARCHIVE_CHANNEL     = "market-archives"
 LOG_CHANNEL         = "market-logs"
 BOUNTY_AUDIT_CH     = "bounty-staff-audit"
 SCAM_AUDIT_CH       = "scam-reports-audit"
+REGISTRY_BOARD_CH   = "scammer-registry"
 ROLE_STAFF          = "Staff"
 ROLE_HITMAN         = "Hitman"
 ROLE_VERIFIED_BROKER= "Verified Broker"
@@ -81,6 +82,7 @@ def _default_data():
         "vouches": {},
         "bounties": {"active":{},"cooldowns":{}},
         "scammer_registry": {"pending":{},"confirmed":{}},
+        "registry_board": {"channel_id": None, "message_id": None},
         "cash_escrow_map": {},
         "cash_rate_history": [],
         "giveaways": {},
@@ -578,6 +580,66 @@ class BountyContractView(View):
 
 
 # ─────────────────────────────────────────────
+#  SCAMMER REGISTRY HELPERS
+# ─────────────────────────────────────────────
+def build_registry_embed(confirmed: dict) -> discord.Embed:
+    """Build the live Scammer Registry embed from all confirmed entries."""
+    embed = discord.Embed(
+        title="🚨 Scammer Registry — Confirmed Bad Actors",
+        color=discord.Color.red(),
+    )
+    if not confirmed:
+        embed.description = (
+            "✅ No confirmed scammers on record yet.\n\n"
+            "Reports submitted via **🚨 Submit Scam Report** are reviewed by staff.\n"
+            "Confirmed entries appear here automatically."
+        )
+    else:
+        lines = []
+        # Sort newest-first
+        sorted_entries = sorted(
+            confirmed.values(),
+            key=lambda e: e.get("added_at", ""),
+            reverse=True,
+        )
+        for i, entry in enumerate(sorted_entries[:25], start=1):
+            name      = entry.get("target_name", "Unknown")
+            stype     = entry.get("scam_type", "Unknown")
+            value     = fmt(entry.get("value", 0))
+            added     = entry.get("added_at", "?")[:10]
+            lines.append(f"`{i:02}.` **{name}** — {stype} — {value} — {added}")
+        if len(confirmed) > 25:
+            lines.append(f"\n*… and {len(confirmed) - 25} more. See `#market-logs` for full history.*")
+        embed.description = "\n".join(lines)
+    updated = datetime.now(timezone.utc).strftime("%d %b %Y %H:%M UTC")
+    embed.set_footer(text=f"⚠️ DO NOT TRADE with listed individuals  •  Last updated: {updated}  •  {len(confirmed)} total entries")
+    return embed
+
+
+async def refresh_registry_board(guild: discord.Guild):
+    """Edit the live registry board message, or skip silently if not set up."""
+    data = load_data()
+    board = data.get("registry_board", {})
+    ch_id  = board.get("channel_id")
+    msg_id = board.get("message_id")
+    if not ch_id or not msg_id:
+        return  # !setup_registry hasn't been run yet
+    channel = guild.get_channel(ch_id)
+    if channel is None:
+        return
+    try:
+        msg = await channel.fetch_message(msg_id)
+        confirmed = data["scammer_registry"].get("confirmed", {})
+        await msg.edit(embed=build_registry_embed(confirmed))
+    except discord.NotFound:
+        # Message was deleted — clear the stored reference so next !setup_registry works cleanly
+        data["registry_board"] = {"channel_id": None, "message_id": None}
+        save_data(data)
+    except Exception as ex:
+        print(f"[RegistryBoard] Could not refresh: {ex}")
+
+
+# ─────────────────────────────────────────────
 #  PERSISTENT VIEW: SCAM AUDIT
 # ─────────────────────────────────────────────
 class ScamAuditView(View):
@@ -621,6 +683,8 @@ class ScamAuditView(View):
         await interaction.response.send_message("✅ Scammer blacklisted and published.", ephemeral=True)
         await interaction.message.edit(content="✅ Report approved and published.", view=None)
         await audit_log(interaction.guild, f"[SCAMMER APPROVED] {interaction.user.mention} blacklisted **{rpt['target_name']}**")
+        # Auto-update the live registry board in #scammer-registry
+        await refresh_registry_board(interaction.guild)
 
     @discord.ui.button(label="❌ Reject Report", style=discord.ButtonStyle.secondary, custom_id="scam_reject")
     async def reject(self, interaction: discord.Interaction, button: Button):
@@ -1914,6 +1978,23 @@ async def setup_reports(ctx):
     except Exception: pass
     await ctx.send(embed=embed, view=ScamReportBoardView())
 
+@bot.command(name="setup_registry")
+@commands.has_permissions(manage_channels=True)
+async def setup_registry(ctx):
+    """Post the live auto-updating Scammer Registry board in this channel."""
+    data      = load_data()
+    confirmed = data["scammer_registry"].get("confirmed", {})
+    embed     = build_registry_embed(confirmed)
+    try: await ctx.message.delete()
+    except Exception: pass
+    msg = await ctx.send(embed=embed)
+    data["registry_board"] = {"channel_id": ctx.channel.id, "message_id": msg.id}
+    save_data(data)
+    await ctx.send(
+        f"✅ Scammer Registry board is live! Every time staff approve a report the embed above will update automatically.",
+        delete_after=20,
+    )
+
 @bot.command(name="market_stats")
 async def market_stats(ctx):
     data    = load_data()
@@ -1935,7 +2016,7 @@ async def market_stats(ctx):
             astat = f"🔴 **LIVE** — *{auction.get('product_name','Item')}* closes <t:{ts}:R>"
         except Exception: astat = "🔴 **LIVE**"
     else: astat = "⚪ No active auction"
-    embed.add_field(name="🔨 Auction House", value=astat, inline=False)
+    embed.add_field(name="🔨 Auction House    ", value=astat, inline=False)
     embed.set_footer(text="SimpleMarketHub | Real-time stats")
     await ctx.reply(embed=embed)
 
