@@ -1,19 +1,14 @@
 # ── Python 3.13 audioop compatibility shim ──────────────────────────────────
-# discord.py 2.3.x hard-imports `audioop` which was removed in Python 3.13.
-# This bot uses no voice features, so a stub is enough to let discord load.
 import sys as _sys
 if _sys.version_info >= (3, 13):
     try:
-        import audioop  # already available (Python ≤ 3.12 or audioop-lts installed)
+        import audioop
     except ModuleNotFoundError:
         try:
-            # audioop-lts installs the real C extension as 'audioop'
             import importlib as _il
             _audioop = _il.import_module("audioop_lts")
             _sys.modules.setdefault("audioop", _audioop)
         except ModuleNotFoundError:
-            # Last resort: minimal stub so discord.py can import cleanly.
-            # All voice/audio calls become no-ops; text features work normally.
             from types import ModuleType as _MT
             _stub = _MT("audioop")
             for _fn in (
@@ -30,7 +25,7 @@ if _sys.version_info >= (3, 13):
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput, Select
-import os, json, asyncio, time
+import os, json, asyncio, time, random
 from datetime import datetime, timedelta, timezone
 
 # ─────────────────────────────────────────────
@@ -86,6 +81,14 @@ def _default_data():
         "cash_escrow_map": {},
         "cash_rate_history": [],
         "giveaways": {},
+        # ── Dynamic auto-mod word list (staff-managed via !banword) ─────────
+        "banned_words": [],
+        # ── Leaderboard tracking ─────────────────────────────────────────────
+        "leaderboard": {
+            "deals":    {},   # user_id(str) → int  (completed sales)
+            "hunting":  {},   # user_id(str) → int  (approved bounty kills)
+            "currency": {},   # user_id(str) → float (total millions sold via escrow)
+        },
     }
 
 def load_data():
@@ -94,8 +97,13 @@ def load_data():
     try:
         with open(DATA_FILE) as f:
             data = json.load(f)
-        for k, v in _default_data().items():
+        defaults = _default_data()
+        for k, v in defaults.items():
             data.setdefault(k, v)
+        # Ensure leaderboard sub-keys exist on older saves
+        lb = data.setdefault("leaderboard", {})
+        for sub in ("deals", "hunting", "currency"):
+            lb.setdefault(sub, {})
         return data
     except Exception:
         return _default_data()
@@ -128,13 +136,12 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 pending: dict[int, dict] = {}
-spam_cooldowns: dict[int, float] = {}   # user_id → last interaction timestamp
+spam_cooldowns: dict[int, float] = {}
 
 # ─────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────
 def check_spam(user_id: int) -> bool:
-    """Returns True if user is on cooldown."""
     last = spam_cooldowns.get(user_id, 0)
     if time.time() - last < SPAM_COOLDOWN_SECS:
         return True
@@ -188,6 +195,50 @@ def log_price(asset_name: str, price: int, listing_type: str):
         data["price_history"][key] = history[-50:]
     save_data(data)
 
+def lb_increment(data: dict, category: str, user_id: int, amount=1):
+    """Safely increment a leaderboard counter for a user. Returns the new score."""
+    lb = data.setdefault("leaderboard", {"deals": {}, "hunting": {}, "currency": {}})
+    board = lb.setdefault(category, {})
+    uid = str(user_id)
+    board[uid] = board.get(uid, 0) + amount
+    return board[uid]
+
+async def _notify_milestones(user_id: int, category: str, new_score: float):
+    """DM a user when they cross a milestone threshold for the first time."""
+    data     = load_data()
+    claimed  = data.setdefault("milestones_claimed", {})
+    user_key = str(user_id)
+    user_cl  = claimed.setdefault(user_key, {})
+    cat_cl   = user_cl.setdefault(category, [])
+
+    newly_unlocked = []
+    for threshold, medal, title in MILESTONE_TIERS.get(category, []):
+        if new_score >= threshold and threshold not in cat_cl:
+            cat_cl.append(threshold)
+            newly_unlocked.append((medal, title, threshold))
+
+    if newly_unlocked:
+        save_data(data)
+        try:
+            user = await bot.fetch_user(user_id)
+            for medal, title, threshold in newly_unlocked:
+                unit  = MILESTONE_UNITS.get(category, "")
+                path  = MILESTONE_PATH_LABELS.get(category, category.title())
+                dm_embed = discord.Embed(
+                    title=f"🏆 MILESTONE UNLOCKED — [{title}]",
+                    description=(
+                        f"Congratulations **{user.display_name}**!\n\n"
+                        f"You've crossed the **{threshold} {unit}** threshold on the **{path}** path.\n\n"
+                        f"{medal}  Your new prestige title: **[{title}]**\n\n"
+                        "*Run `!milestones` to see your full progression board.*"
+                    ),
+                    color=discord.Color.gold(),
+                )
+                dm_embed.set_footer(text="SimpleMarketHub | Prestige Achievement System")
+                await user.send(embed=dm_embed)
+        except Exception:
+            pass
+
 # ─────────────────────────────────────────────
 #  PERSISTENT VIEW: LISTING FOOTER
 # ─────────────────────────────────────────────
@@ -209,8 +260,12 @@ class ListingFooterView(View):
             await interaction.response.send_message("❌ Only the seller or an admin can mark this sold.", ephemeral=True); return
         if lst.get("sold"):
             await interaction.response.send_message("ℹ️ Already marked as sold.", ephemeral=True); return
-        lst["sold"] = True
+        lst["sold"]    = True
+        lst["sold_at"] = datetime.now(timezone.utc).isoformat()
+        # ── Leaderboard: increment deals for the listing owner ──────────────
+        new_score = lb_increment(data, "deals", lst["owner_id"])
         save_data(data)
+        asyncio.create_task(_notify_milestones(lst["owner_id"], "deals", new_score))
         embed = interaction.message.embeds[0]
         embed.color = discord.Color.dark_grey()
         title_clean = embed.title or "Item"
@@ -219,7 +274,6 @@ class ListingFooterView(View):
         dv.add_item(Button(label="🔒 SOLD", style=discord.ButtonStyle.secondary, disabled=True, custom_id="listing_sold_disabled"))
         await interaction.response.send_message("✅ Listing marked as Sold.", ephemeral=True)
         await interaction.message.edit(embed=embed, view=dv)
-        # Log price history
         price_field = next((f.value for f in embed.fields if "Asking Price" in f.name or "Buyout Price" in f.name), None)
         if price_field:
             raw = price_field.replace("$","").replace(",","")
@@ -362,7 +416,6 @@ class MiddlemanRoomView(View):
 
 
 class MMRatingView(View):
-    """Non-persistent — holds middleman_id in instance. 10-min window for parties to rate."""
     def __init__(self, middleman_id: int, middleman_name: str):
         super().__init__(timeout=600)
         self.middleman_id   = middleman_id
@@ -375,7 +428,7 @@ class MMRatingView(View):
         await interaction.response.send_modal(MMRatingModal(self.middleman_id, self.middleman_name))
 
     async def on_timeout(self):
-        pass  # just let the buttons grey out naturally
+        pass
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         print(f"[MMRatingView Error] {error}")
@@ -402,7 +455,6 @@ class MMRatingModal(Modal, title="Rate Your Middleman"):
         data  = load_data()
         entry = data["vouches"].setdefault(str(self.middleman_id), {"ratings": [], "highest_deal": 0})
         entry.setdefault("ratings", [])
-        # Prevent duplicate rating from same user for this session (same-day check)
         today = datetime.now(timezone.utc).isoformat()[:10]
         if any(r.get("rater_id") == interaction.user.id and r.get("date") == today for r in entry["ratings"]):
             await interaction.response.send_message("⚠️ You've already rated this middleman today.", ephemeral=True); return
@@ -583,7 +635,6 @@ class BountyContractView(View):
 #  SCAMMER REGISTRY HELPERS
 # ─────────────────────────────────────────────
 def build_registry_embed(confirmed: dict) -> discord.Embed:
-    """Build the live Scammer Registry embed from all confirmed entries."""
     embed = discord.Embed(
         title="🚨 Scammer Registry — Confirmed Bad Actors",
         color=discord.Color.red(),
@@ -596,17 +647,16 @@ def build_registry_embed(confirmed: dict) -> discord.Embed:
         )
     else:
         lines = []
-        # Sort newest-first
         sorted_entries = sorted(
             confirmed.values(),
             key=lambda e: e.get("added_at", ""),
             reverse=True,
         )
         for i, entry in enumerate(sorted_entries[:25], start=1):
-            name      = entry.get("target_name", "Unknown")
-            stype     = entry.get("scam_type", "Unknown")
-            value     = fmt(entry.get("value", 0))
-            added     = entry.get("added_at", "?")[:10]
+            name  = entry.get("target_name", "Unknown")
+            stype = entry.get("scam_type", "Unknown")
+            value = fmt(entry.get("value", 0))
+            added = entry.get("added_at", "?")[:10]
             lines.append(f"`{i:02}.` **{name}** — {stype} — {value} — {added}")
         if len(confirmed) > 25:
             lines.append(f"\n*… and {len(confirmed) - 25} more. See `#market-logs` for full history.*")
@@ -617,13 +667,12 @@ def build_registry_embed(confirmed: dict) -> discord.Embed:
 
 
 async def refresh_registry_board(guild: discord.Guild):
-    """Edit the live registry board message, or skip silently if not set up."""
-    data = load_data()
+    data  = load_data()
     board = data.get("registry_board", {})
     ch_id  = board.get("channel_id")
     msg_id = board.get("message_id")
     if not ch_id or not msg_id:
-        return  # !setup_registry hasn't been run yet
+        return
     channel = guild.get_channel(ch_id)
     if channel is None:
         return
@@ -632,7 +681,6 @@ async def refresh_registry_board(guild: discord.Guild):
         confirmed = data["scammer_registry"].get("confirmed", {})
         await msg.edit(embed=build_registry_embed(confirmed))
     except discord.NotFound:
-        # Message was deleted — clear the stored reference so next !setup_registry works cleanly
         data["registry_board"] = {"channel_id": None, "message_id": None}
         save_data(data)
     except Exception as ex:
@@ -654,7 +702,6 @@ class ScamAuditView(View):
         rpt  = data["scammer_registry"]["pending"].get(key)
         if rpt is None:
             await interaction.response.send_message("❌ Report not found.", ephemeral=True); return
-        # Confirm and publish
         target_low = normalize(rpt["target_name"])
         confirmed  = data["scammer_registry"]["confirmed"]
         confirmed[target_low] = {
@@ -666,24 +713,19 @@ class ScamAuditView(View):
         }
         del data["scammer_registry"]["pending"][key]
         save_data(data)
-        # Post to public channel (same channel where the panel was)
         public_ch = bot.get_channel(rpt.get("public_channel_id", interaction.channel.id))
-        wall_embed = discord.Embed(
-            title="🚨 VERIFIED SCAMMER — Wall of Shame",
-            color=discord.Color.red(),
-        )
-        wall_embed.add_field(name="👤 Offender", value=rpt["target_name"], inline=True)
-        wall_embed.add_field(name="📁 Scam Type", value=rpt["scam_type"], inline=True)
-        wall_embed.add_field(name="💰 Value Stolen", value=fmt(rpt["value"]), inline=True)
-        wall_embed.add_field(name="📝 Description", value=rpt["description"][:300], inline=False)
-        wall_embed.add_field(name="🔍 Evidence", value=f"[Screenshot]({rpt.get('proof_img','N/A')}) | [Video/URL]({rpt.get('proof_url','N/A')})", inline=False)
+        wall_embed = discord.Embed(title="🚨 VERIFIED SCAMMER — Wall of Shame", color=discord.Color.red())
+        wall_embed.add_field(name="👤 Offender",      value=rpt["target_name"],          inline=True)
+        wall_embed.add_field(name="📁 Scam Type",     value=rpt["scam_type"],            inline=True)
+        wall_embed.add_field(name="💰 Value Stolen",  value=fmt(rpt["value"]),           inline=True)
+        wall_embed.add_field(name="📝 Description",   value=rpt["description"][:300],    inline=False)
+        wall_embed.add_field(name="🔍 Evidence",      value=f"[Screenshot]({rpt.get('proof_img','N/A')}) | [Video/URL]({rpt.get('proof_url','N/A')})", inline=False)
         wall_embed.set_footer(text="⚠️ VERIFIED SCAMMER — DO NOT TRADE")
         if public_ch:
             await public_ch.send(embed=wall_embed)
         await interaction.response.send_message("✅ Scammer blacklisted and published.", ephemeral=True)
         await interaction.message.edit(content="✅ Report approved and published.", view=None)
         await audit_log(interaction.guild, f"[SCAMMER APPROVED] {interaction.user.mention} blacklisted **{rpt['target_name']}**")
-        # Auto-update the live registry board in #scammer-registry
         await refresh_registry_board(interaction.guild)
 
     @discord.ui.button(label="❌ Reject Report", style=discord.ButtonStyle.secondary, custom_id="scam_reject")
@@ -722,48 +764,22 @@ class MainMarketView(View):
         custom_id="market_category_select",
         placeholder="📋 Choose what you want to sell...",
         options=[
-            discord.SelectOption(
-                label="🚗 Sell a Vehicle",
-                value="vehicle",
-                description="Cars, bikes, boats, aircraft & more",
-            ),
-            discord.SelectOption(
-                label="🏡 Sell Real Estate",
-                value="realestate",
-                description="Houses, apartments, garages  •  Verified Broker only",
-            ),
-            discord.SelectOption(
-                label="🎒 Skins & Accessories",
-                value="skins",
-                description="Clothing, weapon skins, collectibles",
-            ),
-            discord.SelectOption(
-                label="🏢 Sell a Business",
-                value="business",
-                description="MC clubs, nightclubs, warehouses  •  Verified Broker only",
-            ),
-            discord.SelectOption(
-                label="🪙 Sell Game Cash",
-                value="gamecash",
-                description="Liquidate in-game cash (RMT)  •  Verified Broker only",
-            ),
+            discord.SelectOption(label="🚗 Sell a Vehicle",    value="vehicle",    description="Cars, bikes, boats, aircraft & more"),
+            discord.SelectOption(label="🏡 Sell Real Estate",  value="realestate", description="Houses, apartments, garages  •  Verified Broker only"),
+            discord.SelectOption(label="🎒 Skins & Accessories",value="skins",     description="Clothing, weapon skins, collectibles"),
+            discord.SelectOption(label="🏢 Sell a Business",   value="business",   description="MC clubs, nightclubs, warehouses  •  Verified Broker only"),
+            discord.SelectOption(label="🪙 Sell Game Cash",    value="gamecash",   description="Liquidate in-game cash (RMT)  •  Verified Broker only"),
         ],
     )
     async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         if not await self._check_entry(interaction): return
         choice = select.values[0]
-
-        # ── Broker-gated categories ──────────────────────────────────────────
         broker_categories = {"realestate", "business", "gamecash"}
         if choice in broker_categories and not has_role(interaction.user, ROLE_VERIFIED_BROKER):
             labels = {"realestate": "real estate", "business": "businesses", "gamecash": "in-game cash"}
             await interaction.response.send_message(
-                f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list {labels[choice]}.",
-                ephemeral=True,
-            )
+                f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list {labels[choice]}.", ephemeral=True)
             return
-
-        # ── Route to the correct flow ────────────────────────────────────────
         if choice == "vehicle":
             await interaction.response.send_message("**Step 1/5** — Select your vehicle type:", view=VehicleTypeView(), ephemeral=True)
         elif choice == "realestate":
@@ -781,7 +797,7 @@ class MainMarketView(View):
 # ─────────────────────────────────────────────
 class SellGameCashModal(Modal, title="🪙 Sell In-Game Cash"):
     amount  = TextInput(label="Total In-Game Cash to Sell (Millions)", placeholder="e.g. 10  →  means $10,000,000 in-game", max_length=10)
-    rate    = TextInput(label="Your Rate per 1 Million (Real Money)", placeholder="e.g. 20  →  $20 real per 1M", max_length=10)
+    rate    = TextInput(label="Your Rate per 1 Million (Real Money)",   placeholder="e.g. 20  →  $20 real per 1M",            max_length=10)
     payment = TextInput(label="Payment Method / In-Game ID Details",
                         placeholder="e.g. PayPal: john@email.com | IGN: BigSeller_99",
                         max_length=200, style=discord.TextStyle.paragraph)
@@ -805,15 +821,15 @@ class SellGameCashModal(Modal, title="🪙 Sell In-Game Cash"):
         user  = interaction.user
         in_game_fmt = f"{amt:g}M  (${int(amt * 1_000_000):,} in-game)"
         embed = discord.Embed(title="🪙 In-Game Cash For Sale", color=discord.Color.gold())
-        embed.add_field(name="💵 Amount",           value=in_game_fmt,             inline=True)
-        embed.add_field(name="📈 Rate",             value=f"${rate:g} per 1M",     inline=True)
-        embed.add_field(name="💰 Total Real Cost",  value=f"${total:,.2f}",        inline=True)
-        embed.add_field(name="💳 Payment / IGN",    value=self.payment.value,      inline=False)
+        embed.add_field(name="💵 Amount",          value=in_game_fmt,         inline=True)
+        embed.add_field(name="📈 Rate",            value=f"${rate:g} per 1M", inline=True)
+        embed.add_field(name="💰 Total Real Cost", value=f"${total:,.2f}",    inline=True)
+        embed.add_field(name="💳 Payment / IGN",   value=self.payment.value,  inline=False)
         embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
         embed.set_footer(text=f"Listed {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | Verified Broker listing")
         msg = await interaction.channel.send(embed=embed, view=CashListingView())
         data = load_data()
-        key = listing_key(interaction.channel.id, msg.id)
+        key  = listing_key(interaction.channel.id, msg.id)
         data["listings"][key] = {
             "type": "gamecash", "owner_id": user.id, "owner_name": str(user),
             "created_at": datetime.now(timezone.utc).isoformat(), "sold": False,
@@ -941,28 +957,38 @@ class CashEscrowView(View):
                     await orig_msg.edit(embed=orig_embed, view=sold_view)
                 except Exception as ex:
                     print(f"[CashEscrow] Could not edit original listing: {ex}")
-            lst["sold"] = True
-            # Log rate to history for !rates command
+            lst["sold"]    = True
+            lst["sold_at"] = datetime.now(timezone.utc).isoformat()
+            # Log rate history
             rate_entry = {
-                "rate":           lst.get("rate_per_million"),
+                "rate":            lst.get("rate_per_million"),
                 "amount_millions": lst.get("amount_millions"),
-                "date":           datetime.now(timezone.utc).isoformat(),
+                "date":            datetime.now(timezone.utc).isoformat(),
+                "seller_id":       lst.get("owner_id"),
             }
             if rate_entry["rate"] and rate_entry["amount_millions"]:
                 history = data.setdefault("cash_rate_history", [])
                 history.append(rate_entry)
                 if len(history) > 200:
                     data["cash_rate_history"] = history[-200:]
+            # ── Leaderboard: add currency volume for the seller ───────────────
+            seller_id = lst.get("owner_id")
+            amt_m     = lst.get("amount_millions") or 0
+            new_currency_score = None
+            if seller_id and amt_m:
+                new_currency_score = lb_increment(data, "currency", seller_id, amt_m)
             save_data(data)
+            if seller_id and new_currency_score is not None:
+                asyncio.create_task(_notify_milestones(seller_id, "currency", new_currency_score))
         log_ch = discord.utils.get(guild.text_channels, name=LOG_CHANNEL)
         if log_ch:
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             receipt_embed = discord.Embed(title="🧾 Cash Trade Receipt — Verified", color=discord.Color.green())
-            receipt_embed.add_field(name="🕵️ Verified By", value=staff.mention,                       inline=True)
-            receipt_embed.add_field(name="📅 Timestamp",   value=ts,                                   inline=True)
-            receipt_embed.add_field(name="📸 Proof",       value=f"[View Screenshot]({proof_url})",    inline=False)
+            receipt_embed.add_field(name="🕵️ Verified By", value=staff.mention,                    inline=True)
+            receipt_embed.add_field(name="📅 Timestamp",   value=ts,                               inline=True)
+            receipt_embed.add_field(name="📸 Proof",       value=f"[View Screenshot]({proof_url})", inline=False)
             if lst:
-                receipt_embed.add_field(name="💼 Seller",  value=f"<@{lst['owner_id']}>",              inline=True)
+                receipt_embed.add_field(name="💼 Seller", value=f"<@{lst['owner_id']}>", inline=True)
             receipt_embed.set_footer(text=f"Escrow channel: #{channel.name}")
             await log_ch.send(embed=receipt_embed)
         done_embed = discord.Embed(
@@ -1112,8 +1138,8 @@ async def _collect_realestate_images(interaction: discord.Interaction):
     pt = snap.get("prop_type","Property"); loc = snap.get("location","?"); grade = snap.get("grade","?"); ap = snap.get("asking_price",0)
     icon = "🏠" if pt=="House" else "🏢"
     embed = discord.Embed(title=f"{icon} {pt} For Sale — {loc}", color=discord.Color.green())
-    embed.add_field(name="Location",       value=loc,   inline=True)
-    embed.add_field(name="Interior Grade", value=grade, inline=True)
+    embed.add_field(name="Location",       value=loc,    inline=True)
+    embed.add_field(name="Interior Grade", value=grade,  inline=True)
     embed.add_field(name="Asking Price",   value=fmt(ap),inline=True)
     embed.add_field(name="📄 Deed",        value=f"[View]({deed_url})", inline=False)
     embed.set_image(url=ext_url)
@@ -1143,11 +1169,15 @@ class SkinTypeView(View):
         await interaction.response.send_modal(SkinModal(select.values[0]))
 
 class SkinModal(Modal):
-    asking_price = TextInput(label="Asking Price ($)", placeholder="e.g. 250000", max_length=15)
     def __init__(self, it):
-        super().__init__(title=f"List a {it}"); self.it = it
-        self.identifier = TextInput(label="Skin Model ID" if it=="Skin" else "Item Catalog Name", placeholder="e.g. SKIN_0042", max_length=80)
+        super().__init__(title=f"List a {it}")
+        self.it = it
+        self.identifier  = TextInput(label="Skin Model ID" if it=="Skin" else "Item Catalog Name",
+                                     placeholder="e.g. SKIN_0042", max_length=80)
+        self.asking_price = TextInput(label="Asking Price ($)", placeholder="e.g. 250000", max_length=15)
         self.add_item(self.identifier)
+        self.add_item(self.asking_price)
+
     async def on_submit(self, interaction: discord.Interaction):
         ok,val,err = validate_price(self.asking_price.value)
         if not ok: await interaction.response.send_message(f"❌ {err}", ephemeral=True); return
@@ -1175,8 +1205,8 @@ async def _collect_skin_images(interaction: discord.Interaction):
     it = snap.get("item_type","Item"); ident = snap.get("identifier","?"); ap = snap.get("asking_price",0)
     icon = "👤" if it=="Skin" else "🎩"
     embed = discord.Embed(title=f"{icon} {it} For Sale — {ident}", color=discord.Color.purple())
-    embed.add_field(name="ID/Name",       value=ident,  inline=True)
-    embed.add_field(name="Asking Price",  value=fmt(ap),inline=True)
+    embed.add_field(name="ID/Name",      value=ident,  inline=True)
+    embed.add_field(name="Asking Price", value=fmt(ap),inline=True)
     embed.add_field(name="📦 Inventory", value=f"[View]({inv_url})", inline=False)
     embed.set_image(url=wear_url)
     embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
@@ -1216,9 +1246,9 @@ class BusinessDaysView(View):
         await interaction.response.send_modal(BusinessModal())
 
 class BusinessModal(Modal, title="Business Listing Details"):
-    address      = TextInput(label="Business Address / Location",  placeholder="e.g. 42 Main St, Arzamas", max_length=100)
-    daily_profit = TextInput(label="Average Daily Profit ($)",      placeholder="e.g. 15000",               max_length=15)
-    buyout_price = TextInput(label="Total Corporate Buyout Price ($)", placeholder="e.g. 2500000",           max_length=15)
+    address      = TextInput(label="Business Address / Location",     placeholder="e.g. 42 Main St, Arzamas", max_length=100)
+    daily_profit = TextInput(label="Average Daily Profit ($)",         placeholder="e.g. 15000",               max_length=15)
+    buyout_price = TextInput(label="Total Corporate Buyout Price ($)", placeholder="e.g. 2500000",             max_length=15)
     async def on_submit(self, interaction: discord.Interaction):
         ok1,dp,e1 = validate_price(self.daily_profit.value)
         ok2,bp,e2 = validate_price(self.buyout_price.value)
@@ -1248,11 +1278,11 @@ async def _collect_business_images(interaction: discord.Interaction):
     bt = snap.get("biz_type","Business"); addr = snap.get("address","?"); days = snap.get("days_owned","?")
     dp = snap.get("daily_profit",0);     bp   = snap.get("buyout_price",0)
     embed = discord.Embed(title=f"🏢 Business For Sale — {bt}", color=discord.Color.orange())
-    embed.add_field(name="Business Type",    value=bt,       inline=True)
-    embed.add_field(name="Address",          value=addr,     inline=True)
+    embed.add_field(name="Business Type",    value=bt,        inline=True)
+    embed.add_field(name="Address",          value=addr,      inline=True)
     embed.add_field(name="Days Owned",       value=f"{days}d",inline=True)
-    embed.add_field(name="Avg Daily Profit", value=fmt(dp),  inline=True)
-    embed.add_field(name="💼 Buyout Price",  value=fmt(bp),  inline=True)
+    embed.add_field(name="Avg Daily Profit", value=fmt(dp),   inline=True)
+    embed.add_field(name="💼 Buyout Price",  value=fmt(bp),   inline=True)
     embed.add_field(name="📊 Dashboard",     value=f"[View]({dash_url})", inline=False)
     embed.set_image(url=ledger_url)
     embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
@@ -1281,9 +1311,9 @@ class LFBoardView(View):
         await interaction.response.send_modal(LFRequestModal())
 
 class LFRequestModal(Modal, title="Looking For — Buyer Request"):
-    asset_name = TextInput(label="Target Asset Name",            placeholder="e.g. Luxury Sultan RS, Elite Village House", max_length=100)
-    max_budget = TextInput(label="Your Maximum Buying Budget ($)",placeholder="e.g. 900000",                               max_length=15)
-    notes      = TextInput(label="Preferred Specs / Notes",       placeholder="e.g. Less than 2 owners, any colour",       max_length=300, required=False)
+    asset_name = TextInput(label="Target Asset Name",             placeholder="e.g. Luxury Sultan RS, Elite Village House", max_length=100)
+    max_budget = TextInput(label="Your Maximum Buying Budget ($)", placeholder="e.g. 900000",                               max_length=15)
+    notes      = TextInput(label="Preferred Specs / Notes",        placeholder="e.g. Less than 2 owners, any colour",       max_length=300, required=False)
     async def on_submit(self, interaction: discord.Interaction):
         ok,budget,err = validate_price(self.max_budget.value)
         if not ok: await interaction.response.send_message(f"❌ {err}", ephemeral=True); return
@@ -1291,9 +1321,9 @@ class LFRequestModal(Modal, title="Looking For — Buyer Request"):
             await interaction.response.send_message("🚨 Inappropriate content blocked.", ephemeral=True); return
         expires = datetime.now(timezone.utc) + timedelta(days=3)
         embed = discord.Embed(title=f"🔍 Looking For — {self.asset_name.value}", color=discord.Color.blurple())
-        embed.add_field(name="Max Budget",  value=fmt(budget),               inline=True)
-        embed.add_field(name="Notes",       value=self.notes.value or "N/A", inline=False)
-        embed.add_field(name="⏰ Expires",  value=f"<t:{int(expires.timestamp())}:R>", inline=True)
+        embed.add_field(name="Max Budget", value=fmt(budget),               inline=True)
+        embed.add_field(name="Notes",      value=self.notes.value or "N/A", inline=False)
+        embed.add_field(name="⏰ Expires", value=f"<t:{int(expires.timestamp())}:R>", inline=True)
         embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
         embed.set_footer(text="Click 🤝 Sell This to Me if you have this item!")
         await interaction.response.send_message("✅ Request posted!", ephemeral=True)
@@ -1309,8 +1339,8 @@ class LFRequestModal(Modal, title="Looking For — Buyer Request"):
         await audit_log(interaction.guild, f"[LF REQUEST] {interaction.user.mention} looking for **{self.asset_name.value}** (budget: {fmt(budget)})")
 
 class LFFulfillModal(Modal, title="Fulfill This Request"):
-    asking_price = TextInput(label="Your Asking Price ($)",  placeholder="e.g. 850000", max_length=15)
-    game_handle  = TextInput(label="Your In-Game Contact / Handle", placeholder="e.g. PlayerTag#1234", max_length=80)
+    asking_price = TextInput(label="Your Asking Price ($)",          placeholder="e.g. 850000",      max_length=15)
+    game_handle  = TextInput(label="Your In-Game Contact / Handle",  placeholder="e.g. PlayerTag#1234", max_length=80)
     def __init__(self, req_key, max_budget):
         super().__init__(); self.req_key = req_key; self.max_budget = max_budget
     async def on_submit(self, interaction: discord.Interaction):
@@ -1349,17 +1379,16 @@ class BountyBoardView(View):
         await interaction.response.send_modal(BountyContractModal())
 
 class BountyContractModal(Modal, title="Anonymous Hit Contract"):
-    target_name = TextInput(label="Target Player Handle / Game Name", placeholder="e.g. BigBadGuy_99",   max_length=80)
-    reward      = TextInput(label="Bounty Reward Pool ($)",           placeholder="e.g. 500000",          max_length=15)
-    terms       = TextInput(label="Reason / Contract Terms",          placeholder="e.g. Gang betrayal",   max_length=300)
+    target_name = TextInput(label="Target Player Handle / Game Name", placeholder="e.g. BigBadGuy_99", max_length=80)
+    reward      = TextInput(label="Bounty Reward Pool ($)",           placeholder="e.g. 500000",        max_length=15)
+    terms       = TextInput(label="Reason / Contract Terms",          placeholder="e.g. Gang betrayal", max_length=300)
     async def on_submit(self, interaction: discord.Interaction):
         ok,val,err = validate_price(self.reward.value)
         if not ok: await interaction.response.send_message(f"❌ {err}", ephemeral=True); return
         if has_bad_words(self.target_name.value) or has_bad_words(self.terms.value):
             await interaction.response.send_message("🚨 Inappropriate content blocked.", ephemeral=True); return
         data = load_data()
-        # Cooldown check
-        tgt_low = normalize(self.target_name.value)
+        tgt_low  = normalize(self.target_name.value)
         cooldown = data["bounties"]["cooldowns"].get(tgt_low)
         if cooldown:
             try:
@@ -1370,10 +1399,10 @@ class BountyContractModal(Modal, title="Anonymous Hit Contract"):
             except Exception: pass
         await interaction.response.send_message("✅ Contract posted!", ephemeral=True)
         embed = discord.Embed(title=f"💀 HIT CONTRACT — {self.target_name.value}", color=discord.Color.dark_red())
-        embed.add_field(name="🎯 Target",        value=self.target_name.value, inline=True)
-        embed.add_field(name="💰 Reward Pool",   value=fmt(val),               inline=True)
-        embed.add_field(name="📜 Terms",         value=self.terms.value,       inline=False)
-        embed.add_field(name="🕶️ Status",        value="⏳ Open — Awaiting Hitman", inline=True)
+        embed.add_field(name="🎯 Target",      value=self.target_name.value,    inline=True)
+        embed.add_field(name="💰 Reward Pool", value=fmt(val),                  inline=True)
+        embed.add_field(name="📜 Terms",       value=self.terms.value,          inline=False)
+        embed.add_field(name="🕶️ Status",      value="⏳ Open — Awaiting Hitman", inline=True)
         embed.set_footer(text=f"Restricted to @{ROLE_HITMAN} members only")
         msg = await interaction.channel.send(embed=embed, view=BountyContractView())
         data["bounties"]["active"][listing_key(interaction.channel.id,msg.id)] = {
@@ -1400,7 +1429,6 @@ async def _collect_bounty_proof(interaction: discord.Interaction, bounty_key: st
         await p.delete()
     except asyncio.TimeoutError:
         await p.delete(); await channel.send(f"{user.mention} ⏰ Timed out.", delete_after=15); return
-    # Route to staff audit channel
     audit_ch = discord.utils.get(channel.guild.text_channels, name=BOUNTY_AUDIT_CH)
     data = load_data()
     bty  = data["bounties"]["active"].get(bounty_key,{})
@@ -1408,14 +1436,13 @@ async def _collect_bounty_proof(interaction: discord.Interaction, bounty_key: st
         audit_embed = discord.Embed(title=f"📑 Bounty Proof Submission — {bty.get('target_name','?')}",
             description=f"Submitted by {user.mention}\n\n[Screenshot 1]({proof1_url})\n[Kill Log]({proof2_url})",
             color=discord.Color.dark_red())
-        audit_embed.add_field(name="Reward",  value=fmt(bty.get("reward",0)), inline=True)
+        audit_embed.add_field(name="Reward", value=fmt(bty.get("reward",0)), inline=True)
         audit_embed.set_footer(text="Staff: verify and award reward manually if confirmed.")
         await audit_ch.send(embed=audit_embed, view=BountyProofApprovalView(bounty_key, user.id))
     await channel.send(f"{user.mention} ✅ Proof submitted! Staff are reviewing your claim.", delete_after=20)
     await audit_log(channel.guild, f"[BOUNTY PROOF] {user.mention} submitted proof for contract on **{bty.get('target_name','?')}**")
 
 class BountyProofApprovalView(View):
-    """Non-persistent — stores bounty_key/hitman_id in instance. 24-hr staff review window."""
     def __init__(self, bounty_key, hitman_id):
         super().__init__(timeout=86400); self.bounty_key=bounty_key; self.hitman_id=hitman_id
 
@@ -1429,7 +1456,10 @@ class BountyProofApprovalView(View):
             bty["completed"] = True
             exp = datetime.now(timezone.utc) + timedelta(hours=48)
             data["bounties"]["cooldowns"][normalize(bty.get("target_name",""))] = exp.isoformat()
+            # ── Leaderboard: increment hunting for confirmed hitman ──────────
+            new_score = lb_increment(data, "hunting", self.hitman_id)
             save_data(data)
+            asyncio.create_task(_notify_milestones(self.hitman_id, "hunting", new_score))
         reward = bty.get("reward",0) if bty else 0
         try:
             hitman = await bot.fetch_user(self.hitman_id)
@@ -1467,10 +1497,10 @@ class ScamReportBoardView(View):
         await interaction.response.send_modal(ScamReportModal())
 
 class ScamReportModal(Modal, title="Submit a Scam Report"):
-    target_name = TextInput(label="Scammer's Game Name & ID",        placeholder="e.g. Badboy_Flipping #884192", max_length=80)
-    scam_type   = TextInput(label="Scam Type / Category",            placeholder="e.g. Vehicle Trade Fraud",    max_length=80)
-    stolen_value= TextInput(label="Stolen Asset Value ($)",           placeholder="e.g. 2500000",                max_length=15)
-    description = TextInput(label="Detailed Description",             placeholder="How did the scam happen?",    max_length=500, style=discord.TextStyle.paragraph)
+    target_name  = TextInput(label="Scammer's Game Name & ID",  placeholder="e.g. Badboy_Flipping #884192", max_length=80)
+    scam_type    = TextInput(label="Scam Type / Category",       placeholder="e.g. Vehicle Trade Fraud",    max_length=80)
+    stolen_value = TextInput(label="Stolen Asset Value ($)",     placeholder="e.g. 2500000",                max_length=15)
+    description  = TextInput(label="Detailed Description",       placeholder="How did the scam happen?",    max_length=500, style=discord.TextStyle.paragraph)
     async def on_submit(self, interaction: discord.Interaction):
         ok,val,err = validate_price(self.stolen_value.value)
         if not ok: await interaction.response.send_message(f"❌ {err}", ephemeral=True); return
@@ -1491,7 +1521,6 @@ class ScamReportModal(Modal, title="Submit a Scam Report"):
 async def _collect_scam_proof(interaction: discord.Interaction):
     user  = interaction.user
     guild = interaction.guild
-    # Resolve channel safely — partial channels lack .guild / .send; fall back to guild cache
     channel = guild.get_channel(interaction.channel_id) if guild else interaction.channel
     if channel is None:
         print(f"[ScamProof] Could not resolve channel {interaction.channel_id}"); return
@@ -1511,18 +1540,17 @@ async def _collect_scam_proof(interaction: discord.Interaction):
     except asyncio.TimeoutError:
         await p.delete(); video_url = "N/A"
     snap["proof_img"] = img_url; snap["proof_url"] = video_url
-    # Route to staff audit — use guild from interaction, not channel.guild
     audit_ch = discord.utils.get(guild.text_channels, name=SCAM_AUDIT_CH) if guild else None
     if not audit_ch:
         await channel.send(f"{user.mention} ⚠️ Staff audit channel `#{SCAM_AUDIT_CH}` not found. Ask an admin to create it.", delete_after=20)
         pending.pop(user.id,None); return
     audit_embed = discord.Embed(title=f"🚨 SCAM REPORT — {snap['target_name']}", color=discord.Color.red())
-    audit_embed.add_field(name="Reporter",    value=user.mention,         inline=True)
-    audit_embed.add_field(name="Scam Type",   value=snap["scam_type"],    inline=True)
-    audit_embed.add_field(name="Value Stolen",value=fmt(snap["value"]),   inline=True)
-    audit_embed.add_field(name="Description", value=snap["description"][:400], inline=False)
-    audit_embed.add_field(name="📸 Screenshot",value=f"[View]({img_url})", inline=True)
-    audit_embed.add_field(name="🔗 Video/URL", value=video_url,            inline=True)
+    audit_embed.add_field(name="Reporter",    value=user.mention,             inline=True)
+    audit_embed.add_field(name="Scam Type",   value=snap["scam_type"],        inline=True)
+    audit_embed.add_field(name="Value Stolen",value=fmt(snap["value"]),       inline=True)
+    audit_embed.add_field(name="Description", value=snap["description"][:400],inline=False)
+    audit_embed.add_field(name="📸 Screenshot",value=f"[View]({img_url})",    inline=True)
+    audit_embed.add_field(name="🔗 Video/URL", value=video_url,               inline=True)
     audit_msg = await audit_ch.send(embed=audit_embed, view=ScamAuditView())
     data = load_data()
     data["scammer_registry"]["pending"][listing_key(audit_ch.id, audit_msg.id)] = snap
@@ -1535,8 +1563,8 @@ async def _collect_scam_proof(interaction: discord.Interaction):
 #  AUCTION HOUSE SETUP
 # ─────────────────────────────────────────────
 class AuctionSetupModal(Modal, title="Create Auction Listing"):
-    product_name = TextInput(label="Product Name",    placeholder="e.g. Sultan RS — Unique Plates", max_length=100)
-    starting_bid = TextInput(label="Starting Bid ($)", placeholder="e.g. 100000",                   max_length=15)
+    product_name = TextInput(label="Product Name",     placeholder="e.g. Sultan RS — Unique Plates", max_length=100)
+    starting_bid = TextInput(label="Starting Bid ($)",  placeholder="e.g. 100000",                   max_length=15)
     async def on_submit(self, interaction: discord.Interaction):
         ok,val,err = validate_price(self.starting_bid.value)
         if not ok: await interaction.response.send_message(f"❌ {err}", ephemeral=True); return
@@ -1554,7 +1582,7 @@ async def _collect_auction_image(interaction: discord.Interaction):
         img_url = m.attachments[0].url
     except asyncio.TimeoutError:
         await channel.send(f"{user.mention} ⏰ Timed out.", delete_after=15); pending.pop(user.id,None); return
-    pname  = snap.get("product_name","Item"); sbid = snap.get("starting_bid",0)
+    pname   = snap.get("product_name","Item"); sbid = snap.get("starting_bid",0)
     ends_at = datetime.now(timezone.utc) + timedelta(hours=24)
     embed = discord.Embed(title=f"🔨 LIVE AUCTION — {pname}",
         description=f"⏰ **Closes:** <t:{int(ends_at.timestamp())}:R> (<t:{int(ends_at.timestamp())}:F>)",
@@ -1575,7 +1603,7 @@ async def _collect_auction_image(interaction: discord.Interaction):
     asyncio.create_task(_delayed_close(max(delay, 0)))
 
 async def _close_auction():
-    data = load_data()
+    data    = load_data()
     auction = data["auction"]
     if not auction["active"]: return
     auction["active"] = False; save_data(data)
@@ -1597,7 +1625,6 @@ async def _close_auction():
         await msg.edit(embed=embed, view=dv)
         if winner_id:
             await ch.send(f"🎉 Congratulations <@{winner_id}>! You won **{auction.get('product_name')}** with **{fmt(auction['current_bid'])}**! Contact <@{auction['owner_id']}> to complete the transaction.")
-            # Log to price history
             log_price(auction.get("product_name","Auction Item"), auction["current_bid"], "auction")
     except Exception as ex:
         print(f"[Auction close error] {ex}")
@@ -1664,7 +1691,6 @@ class MyListingsDeleteView(View):
 async def cleanup_old_listings():
     data = load_data()
     now  = datetime.now(timezone.utc)
-    # 7-day listing cleanup
     cutoff7 = now - timedelta(days=7)
     to_rm = [k for k,v in data["listings"].items()
              if not v.get("sold") and datetime.fromisoformat(v.get("created_at",now.isoformat())).replace(tzinfo=timezone.utc) < cutoff7]
@@ -1677,27 +1703,26 @@ async def cleanup_old_listings():
                 e = discord.Embed(title="📦 Archived Listing",
                     description=f"Listing by <@{lst['owner_id']}> archived after 7 days.",
                     color=discord.Color.greyple())
-                e.add_field(name="Type", value=lst.get("type","?").title(), inline=True)
+                e.add_field(name="Type",   value=lst.get("type","?").title(), inline=True)
                 e.add_field(name="Listed", value=lst.get("created_at","")[:10], inline=True)
                 await arc.send(embed=e)
             try:
                 m = await ch.fetch_message(lst["message_id"]); await m.delete()
             except Exception: pass
         del data["listings"][k]
-    # 3-day LF request cleanup
-    cutoff3 = now - timedelta(days=3)
-    to_rm_lf = [k for k,v in data["lf_requests"].items()
-                if not v.get("fulfilled") and datetime.fromisoformat(v.get("created_at",now.isoformat())).replace(tzinfo=timezone.utc) < cutoff3]
+    cutoff3   = now - timedelta(days=3)
+    to_rm_lf  = [k for k,v in data["lf_requests"].items()
+                 if not v.get("fulfilled") and datetime.fromisoformat(v.get("created_at",now.isoformat())).replace(tzinfo=timezone.utc) < cutoff3]
     for k in to_rm_lf:
         req = data["lf_requests"][k]
         try:
-            ch  = bot.get_channel(req.get("channel_id"))
+            ch = bot.get_channel(req.get("channel_id"))
             if ch:
                 m = await ch.fetch_message(req["message_id"]); await m.delete()
         except Exception: pass
         try:
             buyer = await bot.fetch_user(req["owner_id"])
-            await buyer.send(f"⏰ Your bounty request for **{req['asset_name']}** has expired (3-day limit). Post a fresh one anytime with `!setup_requests`.")
+            await buyer.send(f"⏰ Your request for **{req['asset_name']}** has expired (3-day limit). Post a fresh one anytime with `!setup_requests`.")
         except Exception: pass
         del data["lf_requests"][k]
     if to_rm or to_rm_lf:
@@ -1770,8 +1795,6 @@ class GiveawayView(View):
         entries = gw["entries"]
         if not entries:
             await interaction.response.send_message("⚠️ No one has entered yet! The wheel needs players to spin.", ephemeral=True); return
-
-        # Disable entry button immediately
         gw["ended"] = True
         save_data(data)
         locked_view = View(timeout=None)
@@ -1779,22 +1802,15 @@ class GiveawayView(View):
                                     disabled=True, custom_id="giveaway_closed"))
         locked_view.add_item(Button(label="🌀 Spinning...", style=discord.ButtonStyle.danger,
                                     disabled=True, custom_id="giveaway_spinning"))
-
-        # Fetch member display names for the animation
-        import random
         pool_names = []
         for uid in entries:
             member = interaction.guild.get_member(uid)
             pool_names.append(member.display_name if member else f"Player#{uid}")
-
-        prize = gw["prize"]
+        prize      = gw["prize"]
         spin_embed = interaction.message.embeds[0]
         spin_embed.color = discord.Color.orange()
         spin_embed.title = "🎰 SPINNING THE WHEEL..."
-
         await interaction.response.edit_message(embed=spin_embed, view=locked_view)
-
-        # Animated spin loop — 5 frames at 0.6s each
         for _ in range(5):
             candidate = random.choice(pool_names)
             spin_embed.description = (
@@ -1804,14 +1820,10 @@ class GiveawayView(View):
             )
             await interaction.message.edit(embed=spin_embed, view=locked_view)
             await asyncio.sleep(0.6)
-
-        # Pick winner
-        winner_id   = random.choice(entries)
-        winner      = interaction.guild.get_member(winner_id)
-        winner_name = winner.display_name if winner else f"<@{winner_id}>"
+        winner_id      = random.choice(entries)
+        winner         = interaction.guild.get_member(winner_id)
+        winner_name    = winner.display_name if winner else f"<@{winner_id}>"
         winner_mention = winner.mention if winner else f"<@{winner_id}>"
-
-        # Final winner embed
         win_embed = discord.Embed(
             title="🏆 GIVEAWAY COMPLETED",
             description=(
@@ -1827,14 +1839,10 @@ class GiveawayView(View):
         done_view.add_item(Button(label="🏆 Winner Drawn!", style=discord.ButtonStyle.secondary,
                                   disabled=True, custom_id="giveaway_done"))
         await interaction.message.edit(embed=win_embed, view=done_view)
-
-        # Announce winner publicly in channel
         await interaction.channel.send(
             f"🎉 **GIVEAWAY WINNER** 🎉\n"
             f"Congratulations {winner_mention}! You won **{prize}**! 🏆\n"
             f"Please contact a staff member to claim your prize.")
-
-        # DM the winner
         if winner:
             try:
                 win_dm = discord.Embed(
@@ -1844,8 +1852,6 @@ class GiveawayView(View):
                 await winner.send(embed=win_dm)
             except discord.Forbidden:
                 pass
-
-        # Log to market-logs
         await audit_log(interaction.guild,
             f"[GIVEAWAY] 🏆 **{winner_name}** won **{prize}** ({len(entries)} entrants) — drawn by {interaction.user.mention}")
 
@@ -1931,24 +1937,20 @@ async def gstart(ctx, *, prize: str = ""):
         ),
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="👥 Entries", value="0", inline=True)
-    embed.add_field(name="📋 Status",  value="🟢 Open",  inline=True)
+    embed.add_field(name="👥 Entries", value="0",      inline=True)
+    embed.add_field(name="📋 Status",  value="🟢 Open", inline=True)
     embed.set_footer(text=f"Started by {ctx.author.display_name} | SimpleMarketHub Giveaway System")
     msg = await ctx.send(embed=embed, view=GiveawayView())
     data = load_data()
     key  = listing_key(ctx.channel.id, msg.id)
     data["giveaways"][key] = {
-        "prize":      prize,
-        "host_id":    ctx.author.id,
-        "channel_id": ctx.channel.id,
-        "message_id": msg.id,
-        "entries":    [],
-        "ended":      False,
+        "prize": prize, "host_id": ctx.author.id,
+        "channel_id": ctx.channel.id, "message_id": msg.id,
+        "entries": [], "ended": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     save_data(data)
     await audit_log(ctx.guild, f"[GIVEAWAY] {ctx.author.mention} started giveaway for **{prize}**")
-
 
 @bot.command(name="setup_bounties")
 async def setup_bounties(ctx):
@@ -1981,7 +1983,6 @@ async def setup_reports(ctx):
 @bot.command(name="setup_registry")
 @commands.has_permissions(manage_channels=True)
 async def setup_registry(ctx):
-    """Post the live auto-updating Scammer Registry board in this channel."""
     data      = load_data()
     confirmed = data["scammer_registry"].get("confirmed", {})
     embed     = build_registry_embed(confirmed)
@@ -1990,22 +1991,16 @@ async def setup_registry(ctx):
     msg = await ctx.send(embed=embed)
     data["registry_board"] = {"channel_id": ctx.channel.id, "message_id": msg.id}
     save_data(data)
-    await ctx.send(
-        f"✅ Scammer Registry board is live! Every time staff approve a report the embed above will update automatically.",
-        delete_after=20,
-    )
+    await ctx.send("✅ Scammer Registry board is live! It auto-updates whenever staff approve a report.", delete_after=20)
 
 @bot.command(name="remove_scammer")
 @commands.has_permissions(manage_messages=True)
 async def remove_scammer(ctx, *, name: str = ""):
-    """Remove a confirmed scammer by name and auto-update the registry board."""
     if not name:
         await ctx.reply("❌ Usage: `!remove_scammer <name>`  e.g. `!remove_scammer Badboy_Flipping`", delete_after=15); return
     data      = load_data()
     confirmed = data["scammer_registry"].get("confirmed", {})
     name_low  = normalize(name)
-
-    # Try exact key match first, then partial
     matched_key = None
     if name_low in confirmed:
         matched_key = name_low
@@ -2013,44 +2008,31 @@ async def remove_scammer(ctx, *, name: str = ""):
         for k in confirmed:
             if name_low in k or k in name_low:
                 matched_key = k; break
-
     if matched_key is None:
         known = ", ".join(f"`{v.get('target_name', k)}`" for k, v in list(confirmed.items())[:10])
         await ctx.reply(
             f"❌ No confirmed scammer found matching **{name}**.\n\n"
             f"**Current entries:** {known or 'None'}",
-            mention_author=False, delete_after=20,
-        ); return
-
+            mention_author=False, delete_after=20); return
     removed_name = confirmed[matched_key].get("target_name", matched_key)
     del confirmed[matched_key]
     save_data(data)
-
-    # Auto-refresh the live registry board
     await refresh_registry_board(ctx.guild)
     await audit_log(ctx.guild, f"[REGISTRY REMOVAL] {ctx.author.mention} removed **{removed_name}** from the Scammer Registry.")
-    await ctx.reply(
-        f"✅ **{removed_name}** has been removed from the Scammer Registry and the board has been updated.",
-        mention_author=False,
-    )
+    await ctx.reply(f"✅ **{removed_name}** has been removed from the Scammer Registry and the board has been updated.", mention_author=False)
 
 @bot.command(name="scammer_list")
 async def scammer_list(ctx):
-    """Full paginated view of the confirmed scammer registry."""
     data      = load_data()
     confirmed = data["scammer_registry"].get("confirmed", {})
     if not confirmed:
         await ctx.reply("✅ No confirmed scammers on record yet.", mention_author=False); return
-
-    PAGE_SIZE = 10
+    PAGE_SIZE     = 10
     sorted_entries = sorted(confirmed.values(), key=lambda e: e.get("added_at", ""), reverse=True)
-    pages = [sorted_entries[i:i + PAGE_SIZE] for i in range(0, len(sorted_entries), PAGE_SIZE)]
+    pages          = [sorted_entries[i:i + PAGE_SIZE] for i in range(0, len(sorted_entries), PAGE_SIZE)]
 
     def make_embed(page_entries, page_num, total_pages):
-        embed = discord.Embed(
-            title=f"🚨 Scammer Registry — Full List  (Page {page_num}/{total_pages})",
-            color=discord.Color.red(),
-        )
+        embed  = discord.Embed(title=f"🚨 Scammer Registry — Full List  (Page {page_num}/{total_pages})", color=discord.Color.red())
         offset = (page_num - 1) * PAGE_SIZE
         lines  = []
         for i, entry in enumerate(page_entries, start=offset + 1):
@@ -2070,14 +2052,12 @@ async def scammer_list(ctx):
         def __init__(self):
             super().__init__(timeout=120)
             self.page = 0
-
         @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
         async def prev_page(self, interaction: discord.Interaction, button: Button):
             if interaction.user.id != ctx.author.id:
                 await interaction.response.send_message("❌ Only the person who ran the command can navigate.", ephemeral=True); return
             self.page = (self.page - 1) % len(pages)
             await interaction.response.edit_message(embed=make_embed(pages[self.page], self.page + 1, len(pages)))
-
         @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
         async def next_page(self, interaction: discord.Interaction, button: Button):
             if interaction.user.id != ctx.author.id:
@@ -2087,20 +2067,14 @@ async def scammer_list(ctx):
 
     await ctx.reply(embed=make_embed(pages[0], 1, len(pages)), view=PageView(), mention_author=False)
 
-
 @bot.command(name="pending_reports")
 @commands.has_permissions(manage_messages=True)
 async def pending_reports(ctx):
-    """Show all scam reports currently awaiting staff review."""
     data      = load_data()
     pending_r = data["scammer_registry"].get("pending", {})
     if not pending_r:
         await ctx.reply("✅ No pending reports — audit queue is clear.", mention_author=False); return
-
-    embed = discord.Embed(
-        title=f"📋 Pending Scam Reports — {len(pending_r)} awaiting review",
-        color=discord.Color.orange(),
-    )
+    embed = discord.Embed(title=f"📋 Pending Scam Reports — {len(pending_r)} awaiting review", color=discord.Color.orange())
     for i, (key, rpt) in enumerate(list(pending_r.items())[:20], start=1):
         parts  = key.split("_", 1)
         ch_id  = parts[0] if len(parts) == 2 else "0"
@@ -2109,25 +2083,19 @@ async def pending_reports(ctx):
         embed.add_field(
             name=f"{i}. {rpt.get('target_name', 'Unknown')}",
             value=f"{rpt.get('scam_type', '?')} — {fmt(rpt.get('value', 0))}\n[Jump to report]({jump})",
-            inline=False,
-        )
+            inline=False)
     tip = f"Showing 20 of {len(pending_r)}" if len(pending_r) > 20 else f"All {len(pending_r)} shown"
     embed.set_footer(text=f"{tip}  •  Review & approve/reject in #{SCAM_AUDIT_CH}")
     await ctx.reply(embed=embed, mention_author=False)
 
-
 @bot.command(name="lookup")
 async def lookup(ctx, *, query: str = ""):
-    """One-stop profile check — registry status, listings, escrow rating."""
     if not query:
         await ctx.reply("❌ Usage: `!lookup <game name>`  or  `!lookup @member`", delete_after=15); return
-
     data      = load_data()
     confirmed = data["scammer_registry"].get("confirmed", {})
     member    = ctx.message.mentions[0] if ctx.message.mentions else None
     query_low = normalize(query)
-
-    # ── Scammer registry check ───────────────────────────────────────────────
     scam_entry = None
     if member:
         uid_str = str(member.id)
@@ -2142,24 +2110,16 @@ async def lookup(ctx, *, query: str = ""):
         for k, v in confirmed.items():
             if query_low in k or k in query_low:
                 scam_entry = v; break
-
-    # ── Listing counts (only meaningful if we have a Discord member) ─────────
-    all_listings  = data.get("listings", {})
-    active_count  = 0
-    sold_count    = 0
+    all_listings = data.get("listings", {})
+    active_count = sold_count = 0
     if member:
         active_count = sum(1 for v in all_listings.values() if v.get("owner_id") == member.id and not v.get("sold"))
         sold_count   = sum(1 for v in all_listings.values() if v.get("owner_id") == member.id and v.get("sold"))
-
-    # ── Escrow/vouch rating ──────────────────────────────────────────────────
     vouch_entry = data.get("vouches", {}).get(str(member.id)) if member else None
-
-    # ── Build embed ──────────────────────────────────────────────────────────
     display = member.display_name if member else query
     embed   = discord.Embed(title=f"🔍 Profile Lookup — {display}", color=discord.Color.blurple())
     if member:
         embed.set_thumbnail(url=member.display_avatar.url)
-
     if scam_entry:
         embed.color = discord.Color.red()
         embed.add_field(
@@ -2167,11 +2127,9 @@ async def lookup(ctx, *, query: str = ""):
             value=(f"🚨 **CONFIRMED SCAMMER**\n"
                    f"Type: {scam_entry.get('scam_type','?')}  •  Value: {fmt(scam_entry.get('value',0))}\n"
                    f"Added: {scam_entry.get('added_at','?')[:10]}"),
-            inline=False,
-        )
+            inline=False)
     else:
         embed.add_field(name="✅ Registry Status", value="Clean — not on the Scammer Registry", inline=False)
-
     if member:
         embed.add_field(name="📋 Active Listings", value=str(active_count), inline=True)
         embed.add_field(name="✅ Sold Listings",   value=str(sold_count),   inline=True)
@@ -2181,14 +2139,11 @@ async def lookup(ctx, *, query: str = ""):
             embed.add_field(
                 name="🤝 Escrow Rating",
                 value=f"{'⭐' * round(avg)} ({avg:.1f}/5)  •  {len(ratings)} rated trades",
-                inline=True,
-            )
+                inline=True)
         else:
             embed.add_field(name="🤝 Escrow Rating", value="No ratings yet", inline=True)
-
     embed.set_footer(text="SimpleMarketHub | Profile Lookup")
     await ctx.reply(embed=embed, mention_author=False)
-
 
 @bot.command(name="market_stats")
 async def market_stats(ctx):
@@ -2200,18 +2155,18 @@ async def market_stats(ctx):
     nc      = stats.get("realestate_neighborhood_counts",{})
     hottest = max(nc,key=nc.get) if nc else "N/A"
     embed   = discord.Embed(title="📈 SimpleMarketHub — Economy Dashboard", color=discord.Color.gold())
-    embed.add_field(name="📋 Open Ads",           value=str(open_ads),                         inline=True)
-    embed.add_field(name="🚗 Vehicle Value Total", value=fmt(stats.get("vehicle_value",0)),     inline=True)
+    embed.add_field(name="📋 Open Ads",            value=str(open_ads),                         inline=True)
+    embed.add_field(name="🚗 Vehicle Value Total",  value=fmt(stats.get("vehicle_value",0)),     inline=True)
     embed.add_field(name="🏡 Hottest Neighbourhood",value=hottest,                              inline=True)
     embed.add_field(name="🏢 Biggest Business Deal",value=fmt(stats.get("business_max_deal",0)),inline=True)
     embed.add_field(name="📊 All-Time Ads Posted",  value=str(stats.get("total_ads",0)),        inline=True)
     if auction.get("active"):
         try:
-            ts = int(datetime.fromisoformat(auction["ends_at"]).replace(tzinfo=timezone.utc).timestamp())
+            ts    = int(datetime.fromisoformat(auction["ends_at"]).replace(tzinfo=timezone.utc).timestamp())
             astat = f"🔴 **LIVE** — *{auction.get('product_name','Item')}* closes <t:{ts}:R>"
         except Exception: astat = "🔴 **LIVE**"
     else: astat = "⚪ No active auction"
-    embed.add_field(name="🔨 Auction House    ", value=astat, inline=False)
+    embed.add_field(name="🔨 Auction House", value=astat, inline=False)
     embed.set_footer(text="SimpleMarketHub | Real-time stats")
     await ctx.reply(embed=embed)
 
@@ -2244,77 +2199,58 @@ async def my_listings(ctx):
 
 @bot.command(name="rates")
 async def rates(ctx):
-    data    = load_data()
-    history = data.get("cash_rate_history", [])
-    # Filter to last 10 completed trades for the rate stats
+    data     = load_data()
+    history  = data.get("cash_rate_history", [])
     recent10 = [e for e in history if e.get("rate") and e.get("amount_millions")][-10:]
-    # Filter to last 7 days for weekly volume
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-    weekly = [
-        e for e in history
-        if e.get("amount_millions") and
-        datetime.fromisoformat(e["date"]).replace(tzinfo=timezone.utc) >= cutoff
-    ]
+    cutoff   = datetime.now(timezone.utc) - timedelta(days=7)
+    weekly   = [e for e in history if e.get("amount_millions") and
+                datetime.fromisoformat(e["date"]).replace(tzinfo=timezone.utc) >= cutoff]
     weekly_volume = sum(e["amount_millions"] for e in weekly)
     if not recent10:
-        embed = discord.Embed(
-            title="🪙 GRAND MOBILE ECONOMY RATE HUB",
-            description=(
-                "📊 No completed cash trades yet.\n\n"
-                "Rates are recorded automatically each time a deal is verified through the escrow system.\n"
-                "Complete a trade via **🤝 Request Cash Middleman** to see live rates here."
-            ),
-            color=discord.Color.gold(),
-        )
+        embed = discord.Embed(title="🪙 GRAND MOBILE ECONOMY RATE HUB",
+            description=("📊 No completed cash trades yet.\n\n"
+                         "Rates are recorded automatically each time a deal is verified through the escrow system.\n"
+                         "Complete a trade via **🤝 Request Cash Middleman** to see live rates here."),
+            color=discord.Color.gold())
         embed.set_footer(text="SimpleMarketHub | Rates update after every verified escrow deal")
         await ctx.reply(embed=embed, mention_author=False); return
-    rates_list = [e["rate"] for e in recent10]
-    avg_rate   = sum(rates_list) / len(rates_list)
-    low_rate   = min(rates_list)
-    high_rate  = max(rates_list)
-    last_rate  = recent10[-1]["rate"]
-    last_date  = recent10[-1]["date"][:10]
+    rates_list  = [e["rate"] for e in recent10]
+    avg_rate    = sum(rates_list) / len(rates_list)
+    low_rate    = min(rates_list)
+    high_rate   = max(rates_list)
+    last_rate   = recent10[-1]["rate"]
+    last_date   = recent10[-1]["date"][:10]
     trade_count = len(history)
-    # Trend arrow vs previous average (compare last 5 vs prior 5 if enough data)
     if len(recent10) >= 6:
         old_avg = sum(rates_list[:5]) / 5
         new_avg = sum(rates_list[5:]) / len(rates_list[5:])
         trend = "📈 Rising" if new_avg > old_avg else ("📉 Falling" if new_avg < old_avg else "➡️ Stable")
     else:
         trend = "➡️ Stable"
-    embed = discord.Embed(
-        title="🪙 GRAND MOBILE ECONOMY RATE HUB",
-        description=(
-            f"Live market data from the last **{len(recent10)} verified escrow deals**.\n"
-            f"All rates are in **Real Money per 1 Million in-game cash**."
-        ),
-        color=discord.Color.gold(),
-    )
+    embed = discord.Embed(title="🪙 GRAND MOBILE ECONOMY RATE HUB",
+        description=(f"Live market data from the last **{len(recent10)} verified escrow deals**.\n"
+                     f"All rates are in **Real Money per 1 Million in-game cash**."),
+        color=discord.Color.gold())
     embed.add_field(name="📊 Average Market Rate",  value=f"**${avg_rate:.2f}** / 1M",  inline=True)
     embed.add_field(name="📉 Lowest Recent Rate",   value=f"**${low_rate:.2f}** / 1M",  inline=True)
     embed.add_field(name="📈 Highest Recent Rate",  value=f"**${high_rate:.2f}** / 1M", inline=True)
     embed.add_field(name="🔄 Market Trend",         value=trend,                         inline=True)
     embed.add_field(name="🕒 Last Verified Deal",   value=f"${last_rate:.2f}/1M  ·  {last_date}", inline=True)
     embed.add_field(name="📦 Total Deals Logged",   value=str(trade_count),              inline=True)
-    embed.add_field(
-        name="🌐 Ecosystem Volume (7 days)",
-        value=f"**{weekly_volume:g}M** game cash traded safely this week!",
-        inline=False,
-    )
+    embed.add_field(name="🌐 Ecosystem Volume (7 days)",
+                    value=f"**{weekly_volume:g}M** game cash traded safely this week!", inline=False)
     embed.set_footer(text="SimpleMarketHub | Rates update after every verified escrow deal · Use !price_check for item history")
     await ctx.reply(embed=embed, mention_author=False)
-
 
 @bot.command(name="price_check")
 async def price_check(ctx, *, item: str = ""):
     if not item:
         await ctx.reply("Usage: `!price_check <item name>` e.g. `!price_check Sultan RS`", mention_author=False); return
-    data    = load_data()
-    history = data.get("price_history", {})
-    key_low = normalize(item)
-    # Partial match
+    data     = load_data()
+    history  = data.get("price_history", {})
+    key_low  = normalize(item)
     matches: list = []
-    matched_key = ""
+    matched_key   = ""
     for k, records in history.items():
         if key_low in k or k in key_low:
             matches = records; matched_key = k; break
@@ -2328,20 +2264,18 @@ async def price_check(ctx, *, item: str = ""):
                 mention_author=False)
         else:
             known = ", ".join(f"`{k}`" for k in list(history.keys())[:10])
-            await ctx.reply(
-                f"📊 No sales data for **{item}**.\n\n**Items with recorded sales:** {known}",
-                mention_author=False)
+            await ctx.reply(f"📊 No sales data for **{item}**.\n\n**Items with recorded sales:** {known}", mention_author=False)
         return
     last10  = matches[-10:]
     prices  = [r["price"] for r in last10]
     recent  = last10[-1]
     embed   = discord.Embed(title=f"📊 Price Guide — {matched_key.title()}", color=discord.Color.blue())
-    embed.add_field(name="🔺 Highest Sale",      value=fmt(max(prices)),                      inline=True)
-    embed.add_field(name="🔻 Lowest Sale",        value=fmt(min(prices)),                      inline=True)
-    embed.add_field(name="📈 Avg (last 10 sales)",value=fmt(int(sum(prices)/len(prices))),     inline=True)
-    embed.add_field(name="📦 Total Records",      value=str(len(matches)),                     inline=True)
-    embed.add_field(name="🕒 Last Sale",          value=f"{fmt(recent['price'])} on {recent.get('date','?')}", inline=True)
-    embed.add_field(name="🏷️ Category",           value=recent.get("type","unknown").replace("_"," ").title(), inline=True)
+    embed.add_field(name="🔺 Highest Sale",       value=fmt(max(prices)),                      inline=True)
+    embed.add_field(name="🔻 Lowest Sale",         value=fmt(min(prices)),                      inline=True)
+    embed.add_field(name="📈 Avg (last 10 sales)", value=fmt(int(sum(prices)/len(prices))),     inline=True)
+    embed.add_field(name="📦 Total Records",       value=str(len(matches)),                     inline=True)
+    embed.add_field(name="🕒 Last Sale",           value=f"{fmt(recent['price'])} on {recent.get('date','?')}", inline=True)
+    embed.add_field(name="🏷️ Category",            value=recent.get("type","unknown").replace("_"," ").title(), inline=True)
     embed.set_footer(text="Prices logged from completed sales (Mark as Sold / Auction wins)")
     await ctx.reply(embed=embed, mention_author=False)
 
@@ -2359,9 +2293,9 @@ async def vouches(ctx, member: discord.Member = None):
     stars_str  = "⭐" * round(avg)
     embed      = discord.Embed(title=f"🤝 Certified Escrow Officer — {target.display_name}", color=discord.Color.gold())
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="Total Rated Trades",    value=str(len(ratings)),                inline=True)
-    embed.add_field(name="Reputation Rating",     value=f"{stars_str} ({avg:.1f}/5)",     inline=True)
-    embed.add_field(name="Highest Handled Deal",  value=fmt(entry.get("highest_deal",0)), inline=True)
+    embed.add_field(name="Total Rated Trades",   value=str(len(ratings)),               inline=True)
+    embed.add_field(name="Reputation Rating",    value=f"{stars_str} ({avg:.1f}/5)",    inline=True)
+    embed.add_field(name="Highest Handled Deal", value=fmt(entry.get("highest_deal",0)),inline=True)
     last3 = ratings[-3:]
     for r in reversed(last3):
         embed.add_field(name=f"{'⭐'*r['stars']} — {r.get('date','?')}",
@@ -2410,8 +2344,442 @@ class _ConfirmClearView(View):
 
 
 # ─────────────────────────────────────────────
+#  LEADERBOARD COMMAND
+# ─────────────────────────────────────────────
+LEADERBOARD_CATEGORIES = {
+    "deals":    ("🤝 TOP MERCHANTS — COMPLETED DEALS",    discord.Color.green(),  "deals",    "completed sales"),
+    "hunting":  ("🕶️ TOP HITMEN — BOUNTY CONTRACTS",      discord.Color.dark_red(),"hunting", "approved contract kills"),
+    "currency": ("🪙 TOP BROKERS — CASH VOLUME",          discord.Color.gold(),   "currency", "millions of game cash sold"),
+}
+
+MILESTONE_TIERS: dict[str, list[tuple]] = {
+    "deals": [
+        (10,  "🥉", "Rising Dealer"),
+        (50,  "🥈", "Market Mogul"),
+        (100, "🥇", "Capital Tycoon"),
+    ],
+    "hunting": [
+        (5,   "🥉", "Street Enforcer"),
+        (20,  "🥈", "Shadow Assassin"),
+        (50,  "🥇", "The Apex Reaper"),
+    ],
+    "currency": [
+        (10,  "🥉", "Local Supplier"),
+        (50,  "🥈", "Bank Vault"),
+        (200, "🥇", "The Mint"),
+    ],
+}
+MILESTONE_PATH_LABELS = {"deals": "Merchant", "hunting": "Hunter", "currency": "Cash Wholesaler"}
+MILESTONE_UNITS       = {"deals": "deals",    "hunting": "kills",  "currency": "M sold"}
+
+@bot.command(name="leaderboard")
+async def leaderboard(ctx, category: str = ""):
+    category = category.lower().strip()
+    if category not in LEADERBOARD_CATEGORIES:
+        embed = discord.Embed(
+            title="🏆 Reptile Network Leaderboards",
+            description=(
+                "```ansi\n"
+                "\u001b[1;33m👑 THE HALL OF FAME — REPTILE RANKINGS REFRESHED LIVE 24/7:\u001b[0m\n\n"
+                "┠ !leaderboard deals\n"
+                "    🤝 Top 10 merchants with the most completed sales.\n\n"
+                "┠ !leaderboard hunting\n"
+                "    🕶️ Top 10 elite hitmen with the most approved bounty kills.\n\n"
+                "┯ !leaderboard currency\n"
+                "    🪙 Top 10 brokers moving the largest volume of game cash.\n"
+                "```"
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Choose a category: deals | hunting | currency")
+        await ctx.reply(embed=embed, mention_author=False)
+        return
+
+    title, color, lb_key, unit = LEADERBOARD_CATEGORIES[category]
+    data  = load_data()
+    board = data.get("leaderboard", {}).get(lb_key, {})
+
+    if not board:
+        await ctx.reply(
+            f"📊 No data yet for **{category}** — scores will appear here as activity is recorded.",
+            mention_author=False)
+        return
+
+    # Sort descending and take top 10
+    sorted_entries = sorted(board.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    # Fetch display names for all user IDs
+    rows = []
+    for uid_str, score in sorted_entries:
+        try:
+            user = await bot.fetch_user(int(uid_str))
+            name = user.display_name
+        except Exception:
+            name = f"Unknown User ({uid_str})"
+        rows.append((name, score))
+
+    # Build the table
+    rank_medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = []
+    lines.append("```ansi")
+    lines.append(f"\u001b[1;33m{'RANK':<6} {'PLAYER':<24} SCORE\u001b[0m")
+    lines.append("┠" + "─" * 40)
+    for i, (name, score) in enumerate(rows, start=1):
+        medal  = rank_medals.get(i, f"#{i:02}")
+        # Format score: float for currency (show 1 decimal), int for deals/hunting
+        if lb_key == "currency":
+            score_str = f"{score:,.1f}M"
+        else:
+            score_str = str(int(score))
+        if i == 1:
+            colour_code = "\u001b[1;33m"  # gold
+        elif i == 2:
+            colour_code = "\u001b[0;37m"  # silver
+        elif i == 3:
+            colour_code = "\u001b[0;33m"  # bronze
+        else:
+            colour_code = "\u001b[0m"
+        lines.append(f"{colour_code}{medal:<6} {name[:24]:<24} {score_str}\u001b[0m")
+    lines.append("┯" + "─" * 40)
+    lines.append(f"Unit: {unit}")
+    lines.append("```")
+
+    embed = discord.Embed(
+        title=f"🏆 ─── 『 {title} 』 ─── 🏆",
+        description="\n".join(lines),
+        color=color,
+    )
+    embed.set_footer(text=f"SimpleMarketHub | Live Rankings | !leaderboard deals / hunting / currency")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+# ─────────────────────────────────────────────
+#  MY HISTORY COMMAND
+# ─────────────────────────────────────────────
+@bot.command(name="my_history")
+async def my_history(ctx):
+    """Private personal stats ledger — only visible to the caller."""
+    user = ctx.author
+    uid  = user.id
+    now  = datetime.now(timezone.utc)
+    week_cutoff  = now - timedelta(days=7)
+    month_cutoff = now - timedelta(days=30)
+    data = load_data()
+
+    def _parse_dt(iso: str) -> datetime:
+        try:
+            return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    # ── 1. MERCHANT DASHBOARD ────────────────────────────────────────────────
+    sold_listings = [
+        v for v in data.get("listings", {}).values()
+        if v.get("owner_id") == uid and v.get("sold")
+    ]
+
+    def _deal_value(lst: dict) -> int:
+        """Best-effort price extraction from embed-stored listing data."""
+        return lst.get("asking_price") or lst.get("buyout_price") or lst.get("amount_millions", 0) or 0
+
+    deals_week  = [v for v in sold_listings if _parse_dt(v.get("sold_at", v.get("created_at", ""))) >= week_cutoff]
+    deals_month = [v for v in sold_listings if _parse_dt(v.get("sold_at", v.get("created_at", ""))) >= month_cutoff]
+    lifetime_value = sum(_deal_value(v) for v in sold_listings)
+
+    # ── 2. HITMAN MATRIX ─────────────────────────────────────────────────────
+    all_bounties = data.get("bounties", {}).get("active", {}).values()
+    my_bounties  = [b for b in all_bounties if b.get("hitman_id") == uid]
+
+    pending_contracts   = [b for b in my_bounties if not b.get("completed")]
+    completed_contracts = [b for b in my_bounties if b.get("completed")]
+    total_blood_money   = sum(b.get("reward", 0) for b in completed_contracts)
+
+    is_hitman = has_role(user, ROLE_HITMAN)
+
+    # ── 3. CURRENCY ESCROW BLOCK ─────────────────────────────────────────────
+    all_cash = [
+        e for e in data.get("cash_rate_history", [])
+        if e.get("seller_id") == uid and e.get("amount_millions")
+    ]
+    cash_week  = [e for e in all_cash if _parse_dt(e.get("date", "")) >= week_cutoff]
+    cash_month = [e for e in all_cash if _parse_dt(e.get("date", "")) >= month_cutoff]
+
+    cash_vol_week     = sum(e["amount_millions"] for e in cash_week)
+    cash_vol_month    = sum(e["amount_millions"] for e in cash_month)
+    cash_vol_lifetime = sum(e["amount_millions"] for e in all_cash)
+
+    is_broker = has_role(user, ROLE_VERIFIED_BROKER) or bool(all_cash)
+
+    # ── Build embed ──────────────────────────────────────────────────────────
+    lines = ["```ansi"]
+    lines.append(f"\u001b[1;36m╔══════════════════════════════════════════╗\u001b[0m")
+    lines.append(f"\u001b[1;36m║  PERSONAL PERFORMANCE LEDGER             ║\u001b[0m")
+    lines.append(f"\u001b[1;36m╚══════════════════════════════════════════╝\u001b[0m")
+    lines.append(f"\u001b[0;37mAgent: {user.display_name[:32]}\u001b[0m")
+    lines.append("")
+
+    # Merchant block — always shown
+    lines.append(f"\u001b[1;32m📊 MERCHANT & DEALER DASHBOARD\u001b[0m")
+    lines.append(f"  ┠ Deals This Week  ➔ \u001b[1;33m{len(deals_week)}\u001b[0m  listing(s) closed")
+    lines.append(f"  ┠ Deals This Month ➔ \u001b[1;33m{len(deals_month)}\u001b[0m  listing(s) closed")
+    lines.append(f"  ┠ Lifetime Deals   ➔ \u001b[1;33m{len(sold_listings)}\u001b[0m  total sales on record")
+    lines.append(f"  ┗ Lifetime Value   ➔ \u001b[1;33m{fmt(lifetime_value)}\u001b[0m  total capital moved")
+    lines.append("")
+
+    # Hitman block — shown for @Hitman role holders or anyone with bounty history
+    if is_hitman or my_bounties:
+        lines.append(f"\u001b[1;31m🕶️  UNDERWORLD HITMAN MATRIX\u001b[0m")
+        lines.append(f"  ┠ Pending Contracts ➔ \u001b[1;33m{len(pending_contracts)}\u001b[0m  active hunt(s) locked on radar")
+        lines.append(f"  ┠ Completed Targets ➔ \u001b[1;33m{len(completed_contracts)}\u001b[0m  target(s) neutralized (lifetime)")
+        lines.append(f"  ┗ Total Blood Money ➔ \u001b[1;33m{fmt(total_blood_money)}\u001b[0m  securely claimed")
+        lines.append("")
+
+    # Currency block — shown for Verified Brokers or anyone with cash history
+    if is_broker:
+        lines.append(f"\u001b[1;33m🪙  CURRENCY ESCROW BLOCK\u001b[0m")
+        lines.append(f"  ┠ Liquidated (Week)  ➔ \u001b[1;33m{cash_vol_week:,.1f}M\u001b[0m  game cash cleared")
+        lines.append(f"  ┠ Liquidated (Month) ➔ \u001b[1;33m{cash_vol_month:,.1f}M\u001b[0m  game cash cleared")
+        lines.append(f"  ┗ Lifetime Cleaned   ➔ \u001b[1;33m{cash_vol_lifetime:,.1f}M\u001b[0m  total moved via escrow")
+        lines.append("")
+
+    lines.append("┯" + "─" * 42)
+    lines.append("\u001b[0;37m💡 Only you can see this — fully private.\u001b[0m")
+    lines.append("```")
+
+    embed = discord.Embed(
+        title="📈 ─── 『 PERSONAL TRANSACTION HISTORY 』 ─── 📈",
+        description="\n".join(lines),
+        color=discord.Color.teal(),
+    )
+    embed.set_footer(text="SimpleMarketHub | Confidential Business Analytics · !my_history")
+    embed.set_thumbnail(url=user.display_avatar.url)
+
+    # Send ephemeral via a temporary view trick (prefix commands can't be natively ephemeral)
+    # We send to a DM instead for full privacy, and confirm in-channel.
+    try:
+        await user.send(embed=embed)
+        await ctx.reply(
+            "📬 Your confidential history ledger has been sent to your DMs!",
+            delete_after=10,
+            mention_author=False,
+        )
+    except discord.Forbidden:
+        # DMs closed — fall back to channel reply with a note
+        await ctx.reply(
+            embed=embed,
+            mention_author=False,
+        )
+        await ctx.send(
+            f"{user.mention} ⚠️ Enable DMs from server members so your history stays private!",
+            delete_after=15,
+        )
+
+
+# ─────────────────────────────────────────────
+#  AUTO-MOD: BANWORD COMMANDS
+# ─────────────────────────────────────────────
+@bot.group(name="banword", invoke_without_command=True)
+@commands.has_permissions(manage_messages=True)
+async def banword(ctx):
+    """Manage the dynamic banned-word filter. Use add / remove / list."""
+    embed = discord.Embed(
+        title="🛡️ Auto-Mod — Banned Word Engine",
+        description=(
+            "```\n"
+            "!banword add <word or phrase>   — Add to filter\n"
+            "!banword remove <word or phrase>— Remove from filter\n"
+            "!banword list                   — List all banned phrases\n"
+            "```"
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="Restricted to Manage Messages / Administrator")
+    await ctx.reply(embed=embed, mention_author=False)
+
+@banword.command(name="add")
+@commands.has_permissions(manage_messages=True)
+async def banword_add(ctx, *, phrase: str = ""):
+    if not phrase:
+        await ctx.reply("❌ Usage: `!banword add <word or phrase>`", delete_after=10); return
+    phrase_low = phrase.lower().strip()
+    data  = load_data()
+    words = data.setdefault("banned_words", [])
+    if phrase_low in words:
+        await ctx.reply(f"ℹ️ `{phrase_low}` is already in the filter.", delete_after=10); return
+    words.append(phrase_low)
+    save_data(data)
+    await ctx.reply(f"✅ `{phrase_low}` added to the auto-mod filter.", mention_author=False)
+    await audit_log(ctx.guild, f"[AUTO-MOD] {ctx.author.mention} added banned phrase: `{phrase_low}`")
+
+@banword.command(name="remove")
+@commands.has_permissions(manage_messages=True)
+async def banword_remove(ctx, *, phrase: str = ""):
+    if not phrase:
+        await ctx.reply("❌ Usage: `!banword remove <word or phrase>`", delete_after=10); return
+    phrase_low = phrase.lower().strip()
+    data  = load_data()
+    words = data.setdefault("banned_words", [])
+    if phrase_low not in words:
+        await ctx.reply(f"❌ `{phrase_low}` is not in the filter.", delete_after=10); return
+    words.remove(phrase_low)
+    save_data(data)
+    await ctx.reply(f"✅ `{phrase_low}` removed from the auto-mod filter.", mention_author=False)
+    await audit_log(ctx.guild, f"[AUTO-MOD] {ctx.author.mention} removed banned phrase: `{phrase_low}`")
+
+@banword.command(name="list")
+@commands.has_permissions(manage_messages=True)
+async def banword_list(ctx):
+    data  = load_data()
+    words = data.get("banned_words", [])
+    embed = discord.Embed(
+        title="🛡️ Auto-Mod — Active Filter List",
+        color=discord.Color.orange(),
+    )
+    if not words:
+        embed.description = "✅ No custom banned phrases set.\n\nUse `!banword add <phrase>` to add one."
+    else:
+        static_count  = len(BAD_WORDS)
+        dynamic_count = len(words)
+        lines = "\n".join(f"`{i+1:02}.` {w}" for i, w in enumerate(words))
+        embed.description = (
+            f"**{dynamic_count}** custom phrase(s) active:\n\n{lines}\n\n"
+            f"*Plus {static_count} built-in profanity filters always active.*"
+        )
+    embed.set_footer(text="Manage with !banword add / remove")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+# ─────────────────────────────────────────────
+#  MILESTONES COMMAND
+# ─────────────────────────────────────────────
+def _progress_bar(current: float, target: float, length: int = 10) -> str:
+    filled = min(int((current / target) * length), length)
+    return "▰" * filled + "▱" * (length - filled)
+
+def _tier_block(category: str, score: float, claimed: list) -> list[str]:
+    """Return ANSI-styled lines for one milestone path."""
+    tiers = MILESTONE_TIERS[category]
+    icons = {"deals": "🚗", "hunting": "🕶️", "currency": "🪙"}
+    headers = {
+        "deals":    "THE MERCHANT PROGRESSION",
+        "hunting":  "THE UNDERWORLD RADAR",
+        "currency": "THE CASH WHOLESALE VAULT",
+    }
+    lines = [f"\u001b[1;33m{icons[category]}  {headers[category]}\u001b[0m"]
+
+    # Unlocked tiers
+    for threshold, medal, title in tiers:
+        if score >= threshold:
+            lines.append(f"  ┠ {medal} \u001b[1;32m[{title}]\u001b[0m  ✅ UNLOCKED  ({threshold} {MILESTONE_UNITS[category]})")
+        else:
+            lines.append(f"  ┠ {medal} [{title}]  ⬜ {threshold} {MILESTONE_UNITS[category]}")
+
+    # Progress bar toward next unlock
+    next_tier = next(((t, medal, title) for t, medal, title in tiers if score < t), None)
+    if next_tier:
+        t, medal, title = next_tier
+        bar = _progress_bar(score, t)
+        if category == "currency":
+            score_str = f"{score:,.1f}"
+        else:
+            score_str = str(int(score))
+        lines.append(f"  ┗ Progress → [{bar}] \u001b[1;36m{score_str}/{t}\u001b[0m to **{title}**")
+    else:
+        lines.append(f"  ┗ \u001b[1;33m🏆 MAX RANK ACHIEVED\u001b[0m — All titles unlocked!")
+
+    return lines
+
+@bot.command(name="milestones")
+async def milestones(ctx, member: discord.Member = None):
+    """Show prestige milestone progression for yourself or another member."""
+    target = member or ctx.author
+    uid    = target.id
+    data   = load_data()
+
+    lb      = data.get("leaderboard", {})
+    claimed = data.get("milestones_claimed", {}).get(str(uid), {})
+
+    deals_score    = lb.get("deals",    {}).get(str(uid), 0)
+    hunting_score  = lb.get("hunting",  {}).get(str(uid), 0)
+    currency_score = lb.get("currency", {}).get(str(uid), 0.0)
+
+    # Count total unlocked titles across all paths
+    total_unlocked = sum(
+        1 for cat, tiers in MILESTONE_TIERS.items()
+        for threshold, _, _ in tiers
+        if lb.get(cat, {}).get(str(uid), 0) >= threshold
+    )
+    total_possible = sum(len(v) for v in MILESTONE_TIERS.values())
+
+    lines = ["```ansi"]
+    lines.append(f"\u001b[1;33m╔══════════════════════════════════════════╗\u001b[0m")
+    lines.append(f"\u001b[1;33m║  NETWORK MILESTONES & PRESTIGE TITLES    ║\u001b[0m")
+    lines.append(f"\u001b[1;33m╚══════════════════════════════════════════╝\u001b[0m")
+    lines.append(f"\u001b[0;37mAgent: {target.display_name[:32]}\u001b[0m")
+    lines.append(f"\u001b[0;37mTitles Unlocked: {total_unlocked}/{total_possible}\u001b[0m")
+    lines.append("")
+
+    for cat, score in [("deals", deals_score), ("hunting", hunting_score), ("currency", currency_score)]:
+        lines.extend(_tier_block(cat, score, claimed.get(cat, [])))
+        lines.append("")
+
+    lines.append("┯" + "─" * 42)
+    lines.append("\u001b[0;37m💡 Thresholds auto-trigger a DM the instant you cross them.\u001b[0m")
+    lines.append("```")
+
+    embed = discord.Embed(
+        title=f"🎖️ ─── 『 NETWORK MILESTONES & TITLES 』 ─── 🎖️",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text="SimpleMarketHub | Prestige Achievement System · !milestones")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+# ─────────────────────────────────────────────
 #  EVENTS
 # ─────────────────────────────────────────────
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore bots
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    content_low = message.content.lower()
+
+    # Check static built-in list + dynamic staff-managed list
+    data         = load_data()
+    dynamic_words= data.get("banned_words", [])
+    all_banned   = [w.lower() for w in BAD_WORDS] + dynamic_words
+
+    triggered = next((w for w in all_banned if w in content_low), None)
+    if triggered:
+        try:
+            await message.delete()
+        except (discord.Forbidden, discord.NotFound):
+            pass
+        try:
+            await message.channel.send(
+                "⚠️ Message removed automatically by Auto-Mod. "
+                "Profanity or unapproved promotional advertising is prohibited here.",
+                delete_after=5,
+            )
+        except Exception:
+            pass
+        # Log silently to market-logs
+        if message.guild:
+            await audit_log(
+                message.guild,
+                f"[AUTO-MOD] Deleted message from {message.author.mention} "
+                f"in {message.channel.mention} — matched filter: `{triggered}`",
+            )
+        return  # do not process commands from deleted messages
+
+    await bot.process_commands(message)
+
+
 @bot.event
 async def on_ready():
     print(f"✅ SimpleMarketHub Bot online — {bot.user} ({bot.user.id})")
@@ -2430,12 +2798,11 @@ async def on_ready():
     bot.add_view(GiveawayView())
     cleanup_old_listings.start()
     check_auction_expiry.start()
-    # Resume any active auction
-    data = load_data()
-    auction = data.get("auction",{})
+    data    = load_data()
+    auction = data.get("auction", {})
     if auction.get("active") and auction.get("ends_at"):
         try:
-            end = datetime.fromisoformat(auction["ends_at"]).replace(tzinfo=timezone.utc)
+            end   = datetime.fromisoformat(auction["ends_at"]).replace(tzinfo=timezone.utc)
             delay = (end - datetime.now(timezone.utc)).total_seconds()
             if delay > 0:
                 print(f"[Auction] Resuming — closes in {int(delay)}s")
@@ -2454,17 +2821,19 @@ async def on_command_error(ctx, error):
         await ctx.reply(f"❌ Missing argument: `{error.param.name}`. Check `!help {ctx.invoked_with}`.", delete_after=15); return
     if isinstance(error, commands.BadArgument):
         await ctx.reply(f"❌ Invalid argument. Check `!help {ctx.invoked_with}`.", delete_after=15); return
-    # Unwrap CommandInvokeError to get the real exception
     inner = getattr(error, "original", error)
-    print(f"[Error in !{ctx.invoked_with}] {type(inner).__name__}: {inner}")
-    await ctx.reply(f"❌ Something went wrong running that command. The error has been logged.", delete_after=20)
+    print(f"[Command Error] {ctx.command}: {inner}")
+    try:
+        await ctx.reply(f"❌ An unexpected error occurred: `{type(inner).__name__}`", delete_after=15)
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────
-#  ENTRYPOINT
+#  RUN
 # ─────────────────────────────────────────────
-async def main():
-    async with bot:
-        await bot.start(TOKEN)
-
-asyncio.run(main())
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN environment variable is not set.")
+    else:
+        bot.run(TOKEN)
