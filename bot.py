@@ -1,3 +1,32 @@
+# ── Python 3.13 audioop compatibility shim ──────────────────────────────────
+# discord.py 2.3.x hard-imports `audioop` which was removed in Python 3.13.
+# This bot uses no voice features, so a stub is enough to let discord load.
+import sys as _sys
+if _sys.version_info >= (3, 13):
+    try:
+        import audioop  # already available (Python ≤ 3.12 or audioop-lts installed)
+    except ModuleNotFoundError:
+        try:
+            # audioop-lts installs the real C extension as 'audioop'
+            import importlib as _il
+            _audioop = _il.import_module("audioop_lts")
+            _sys.modules.setdefault("audioop", _audioop)
+        except ModuleNotFoundError:
+            # Last resort: minimal stub so discord.py can import cleanly.
+            # All voice/audio calls become no-ops; text features work normally.
+            from types import ModuleType as _MT
+            _stub = _MT("audioop")
+            for _fn in (
+                "add", "adpcm2lin", "alaw2lin", "avg", "avgpp", "bias",
+                "byteswap", "cross", "findfactor", "findfit", "findmax",
+                "getsample", "lin2adpcm", "lin2alaw", "lin2lin", "lin2ulaw",
+                "max", "maxpp", "minmax", "mul", "ratecv", "reverse", "rms",
+                "tomono", "tostereo", "ulaw2lin",
+            ):
+                setattr(_stub, _fn, lambda *a, **k: b"")
+            _sys.modules["audioop"] = _stub
+# ─────────────────────────────────────────────────────────────────────────────
+
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput, Select
@@ -633,6 +662,8 @@ class MainMarketView(View):
     @discord.ui.button(label="🏡 Sell Real Estate",  style=discord.ButtonStyle.success,   custom_id="market_realestate", row=0)
     async def sell_realestate(self, interaction: discord.Interaction, button: Button):
         if not await self._check_entry(interaction): return
+        if not has_role(interaction.user, ROLE_VERIFIED_BROKER):
+            await interaction.response.send_message(f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list real estate.", ephemeral=True); return
         await interaction.response.send_message("**Step 1/6** — Select property type:", view=RealEstateTypeView(), ephemeral=True)
 
     @discord.ui.button(label="🎒 Skins & Accessories",style=discord.ButtonStyle.secondary, custom_id="market_skins",     row=1)
@@ -643,6 +674,8 @@ class MainMarketView(View):
     @discord.ui.button(label="🏢 Sell a Business",   style=discord.ButtonStyle.danger,    custom_id="market_business",   row=1)
     async def sell_business(self, interaction: discord.Interaction, button: Button):
         if not await self._check_entry(interaction): return
+        if not has_role(interaction.user, ROLE_VERIFIED_BROKER):
+            await interaction.response.send_message(f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list businesses.", ephemeral=True); return
         await interaction.response.send_message("**Step 1/5** — Select your business type:", view=BusinessTypeView(), ephemeral=True)
 
     @discord.ui.button(label="🪙 Sell Game Cash", style=discord.ButtonStyle.primary, custom_id="market_gamecash", row=2)
