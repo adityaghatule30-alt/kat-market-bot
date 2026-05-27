@@ -1,2 +1,2 @@
-[providers.python]
-pythonVersion = "3.11" 
+[providers]
+python = "3.11"
