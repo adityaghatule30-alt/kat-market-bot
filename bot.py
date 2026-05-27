@@ -654,39 +654,62 @@ class MainMarketView(View):
             await interaction.response.send_message("❌ Access Denied: Your account is on the Scammer Registry.", ephemeral=True); return False
         return True
 
-    @discord.ui.button(label="🚗 Sell a Vehicle",    style=discord.ButtonStyle.primary,   custom_id="market_vehicle",    row=0)
-    async def sell_vehicle(self, interaction: discord.Interaction, button: Button):
+    @discord.ui.select(
+        custom_id="market_category_select",
+        placeholder="📋 Choose what you want to sell...",
+        options=[
+            discord.SelectOption(
+                label="🚗 Sell a Vehicle",
+                value="vehicle",
+                description="Cars, bikes, boats, aircraft & more",
+            ),
+            discord.SelectOption(
+                label="🏡 Sell Real Estate",
+                value="realestate",
+                description="Houses, apartments, garages  •  Verified Broker only",
+            ),
+            discord.SelectOption(
+                label="🎒 Skins & Accessories",
+                value="skins",
+                description="Clothing, weapon skins, collectibles",
+            ),
+            discord.SelectOption(
+                label="🏢 Sell a Business",
+                value="business",
+                description="MC clubs, nightclubs, warehouses  •  Verified Broker only",
+            ),
+            discord.SelectOption(
+                label="🪙 Sell Game Cash",
+                value="gamecash",
+                description="Liquidate in-game cash (RMT)  •  Verified Broker only",
+            ),
+        ],
+    )
+    async def category_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         if not await self._check_entry(interaction): return
-        await interaction.response.send_message("**Step 1/5** — Select your vehicle type:", view=VehicleTypeView(), ephemeral=True)
+        choice = select.values[0]
 
-    @discord.ui.button(label="🏡 Sell Real Estate",  style=discord.ButtonStyle.success,   custom_id="market_realestate", row=0)
-    async def sell_realestate(self, interaction: discord.Interaction, button: Button):
-        if not await self._check_entry(interaction): return
-        if not has_role(interaction.user, ROLE_VERIFIED_BROKER):
-            await interaction.response.send_message(f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list real estate.", ephemeral=True); return
-        await interaction.response.send_message("**Step 1/6** — Select property type:", view=RealEstateTypeView(), ephemeral=True)
+        # ── Broker-gated categories ──────────────────────────────────────────
+        broker_categories = {"realestate", "business", "gamecash"}
+        if choice in broker_categories and not has_role(interaction.user, ROLE_VERIFIED_BROKER):
+            labels = {"realestate": "real estate", "business": "businesses", "gamecash": "in-game cash"}
+            await interaction.response.send_message(
+                f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list {labels[choice]}.",
+                ephemeral=True,
+            )
+            return
 
-    @discord.ui.button(label="🎒 Skins & Accessories",style=discord.ButtonStyle.secondary, custom_id="market_skins",     row=1)
-    async def sell_skins(self, interaction: discord.Interaction, button: Button):
-        if not await self._check_entry(interaction): return
-        await interaction.response.send_message("**Step 1/4** — Select item type:", view=SkinTypeView(), ephemeral=True)
-
-    @discord.ui.button(label="🏢 Sell a Business",   style=discord.ButtonStyle.danger,    custom_id="market_business",   row=1)
-    async def sell_business(self, interaction: discord.Interaction, button: Button):
-        if not await self._check_entry(interaction): return
-        if not has_role(interaction.user, ROLE_VERIFIED_BROKER):
-            await interaction.response.send_message(f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list businesses.", ephemeral=True); return
-        await interaction.response.send_message("**Step 1/5** — Select your business type:", view=BusinessTypeView(), ephemeral=True)
-
-    @discord.ui.button(label="🪙 Sell Game Cash", style=discord.ButtonStyle.primary, custom_id="market_gamecash", row=2)
-    async def sell_game_cash(self, interaction: discord.Interaction, button: Button):
-        if check_spam(interaction.user.id):
-            await interaction.response.send_message("⚠️ Slow down! Wait a few seconds.", ephemeral=True); return
-        if not has_role(interaction.user, ROLE_VERIFIED_BROKER):
-            await interaction.response.send_message(f"❌ Only members with the **@{ROLE_VERIFIED_BROKER}** role can list in-game cash.", ephemeral=True); return
-        if is_blacklisted(interaction.user):
-            await interaction.response.send_message("❌ Access Denied: Your account is on the Scammer Registry.", ephemeral=True); return
-        await interaction.response.send_modal(SellGameCashModal())
+        # ── Route to the correct flow ────────────────────────────────────────
+        if choice == "vehicle":
+            await interaction.response.send_message("**Step 1/5** — Select your vehicle type:", view=VehicleTypeView(), ephemeral=True)
+        elif choice == "realestate":
+            await interaction.response.send_message("**Step 1/6** — Select property type:", view=RealEstateTypeView(), ephemeral=True)
+        elif choice == "skins":
+            await interaction.response.send_message("**Step 1/4** — Select item type:", view=SkinTypeView(), ephemeral=True)
+        elif choice == "business":
+            await interaction.response.send_message("**Step 1/5** — Select your business type:", view=BusinessTypeView(), ephemeral=True)
+        elif choice == "gamecash":
+            await interaction.response.send_modal(SellGameCashModal())
 
 
 # ─────────────────────────────────────────────
