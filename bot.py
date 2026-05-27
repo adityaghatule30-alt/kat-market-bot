@@ -1995,6 +1995,201 @@ async def setup_registry(ctx):
         delete_after=20,
     )
 
+@bot.command(name="remove_scammer")
+@commands.has_permissions(manage_messages=True)
+async def remove_scammer(ctx, *, name: str = ""):
+    """Remove a confirmed scammer by name and auto-update the registry board."""
+    if not name:
+        await ctx.reply("❌ Usage: `!remove_scammer <name>`  e.g. `!remove_scammer Badboy_Flipping`", delete_after=15); return
+    data      = load_data()
+    confirmed = data["scammer_registry"].get("confirmed", {})
+    name_low  = normalize(name)
+
+    # Try exact key match first, then partial
+    matched_key = None
+    if name_low in confirmed:
+        matched_key = name_low
+    else:
+        for k in confirmed:
+            if name_low in k or k in name_low:
+                matched_key = k; break
+
+    if matched_key is None:
+        known = ", ".join(f"`{v.get('target_name', k)}`" for k, v in list(confirmed.items())[:10])
+        await ctx.reply(
+            f"❌ No confirmed scammer found matching **{name}**.\n\n"
+            f"**Current entries:** {known or 'None'}",
+            mention_author=False, delete_after=20,
+        ); return
+
+    removed_name = confirmed[matched_key].get("target_name", matched_key)
+    del confirmed[matched_key]
+    save_data(data)
+
+    # Auto-refresh the live registry board
+    await refresh_registry_board(ctx.guild)
+    await audit_log(ctx.guild, f"[REGISTRY REMOVAL] {ctx.author.mention} removed **{removed_name}** from the Scammer Registry.")
+    await ctx.reply(
+        f"✅ **{removed_name}** has been removed from the Scammer Registry and the board has been updated.",
+        mention_author=False,
+    )
+
+@bot.command(name="scammer_list")
+async def scammer_list(ctx):
+    """Full paginated view of the confirmed scammer registry."""
+    data      = load_data()
+    confirmed = data["scammer_registry"].get("confirmed", {})
+    if not confirmed:
+        await ctx.reply("✅ No confirmed scammers on record yet.", mention_author=False); return
+
+    PAGE_SIZE = 10
+    sorted_entries = sorted(confirmed.values(), key=lambda e: e.get("added_at", ""), reverse=True)
+    pages = [sorted_entries[i:i + PAGE_SIZE] for i in range(0, len(sorted_entries), PAGE_SIZE)]
+
+    def make_embed(page_entries, page_num, total_pages):
+        embed = discord.Embed(
+            title=f"🚨 Scammer Registry — Full List  (Page {page_num}/{total_pages})",
+            color=discord.Color.red(),
+        )
+        offset = (page_num - 1) * PAGE_SIZE
+        lines  = []
+        for i, entry in enumerate(page_entries, start=offset + 1):
+            name  = entry.get("target_name", "Unknown")
+            stype = entry.get("scam_type", "Unknown")
+            value = fmt(entry.get("value", 0))
+            added = entry.get("added_at", "?")[:10]
+            lines.append(f"`{i:02}.` **{name}**\n└ {stype} — {value} — {added}")
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Total confirmed scammers: {len(confirmed)}  •  ⚠️ DO NOT TRADE with listed individuals")
+        return embed
+
+    if len(pages) == 1:
+        await ctx.reply(embed=make_embed(pages[0], 1, 1), mention_author=False); return
+
+    class PageView(View):
+        def __init__(self):
+            super().__init__(timeout=120)
+            self.page = 0
+
+        @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+        async def prev_page(self, interaction: discord.Interaction, button: Button):
+            if interaction.user.id != ctx.author.id:
+                await interaction.response.send_message("❌ Only the person who ran the command can navigate.", ephemeral=True); return
+            self.page = (self.page - 1) % len(pages)
+            await interaction.response.edit_message(embed=make_embed(pages[self.page], self.page + 1, len(pages)))
+
+        @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+        async def next_page(self, interaction: discord.Interaction, button: Button):
+            if interaction.user.id != ctx.author.id:
+                await interaction.response.send_message("❌ Only the person who ran the command can navigate.", ephemeral=True); return
+            self.page = (self.page + 1) % len(pages)
+            await interaction.response.edit_message(embed=make_embed(pages[self.page], self.page + 1, len(pages)))
+
+    await ctx.reply(embed=make_embed(pages[0], 1, len(pages)), view=PageView(), mention_author=False)
+
+
+@bot.command(name="pending_reports")
+@commands.has_permissions(manage_messages=True)
+async def pending_reports(ctx):
+    """Show all scam reports currently awaiting staff review."""
+    data      = load_data()
+    pending_r = data["scammer_registry"].get("pending", {})
+    if not pending_r:
+        await ctx.reply("✅ No pending reports — audit queue is clear.", mention_author=False); return
+
+    embed = discord.Embed(
+        title=f"📋 Pending Scam Reports — {len(pending_r)} awaiting review",
+        color=discord.Color.orange(),
+    )
+    for i, (key, rpt) in enumerate(list(pending_r.items())[:20], start=1):
+        parts  = key.split("_", 1)
+        ch_id  = parts[0] if len(parts) == 2 else "0"
+        msg_id = parts[1] if len(parts) == 2 else "0"
+        jump   = f"https://discord.com/channels/{ctx.guild.id}/{ch_id}/{msg_id}"
+        embed.add_field(
+            name=f"{i}. {rpt.get('target_name', 'Unknown')}",
+            value=f"{rpt.get('scam_type', '?')} — {fmt(rpt.get('value', 0))}\n[Jump to report]({jump})",
+            inline=False,
+        )
+    tip = f"Showing 20 of {len(pending_r)}" if len(pending_r) > 20 else f"All {len(pending_r)} shown"
+    embed.set_footer(text=f"{tip}  •  Review & approve/reject in #{SCAM_AUDIT_CH}")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
+@bot.command(name="lookup")
+async def lookup(ctx, *, query: str = ""):
+    """One-stop profile check — registry status, listings, escrow rating."""
+    if not query:
+        await ctx.reply("❌ Usage: `!lookup <game name>`  or  `!lookup @member`", delete_after=15); return
+
+    data      = load_data()
+    confirmed = data["scammer_registry"].get("confirmed", {})
+    member    = ctx.message.mentions[0] if ctx.message.mentions else None
+    query_low = normalize(query)
+
+    # ── Scammer registry check ───────────────────────────────────────────────
+    scam_entry = None
+    if member:
+        uid_str = str(member.id)
+        if uid_str in confirmed:
+            scam_entry = confirmed[uid_str]
+        else:
+            name_low = normalize(member.display_name)
+            for k, v in confirmed.items():
+                if name_low in k or k in name_low:
+                    scam_entry = v; break
+    if not scam_entry:
+        for k, v in confirmed.items():
+            if query_low in k or k in query_low:
+                scam_entry = v; break
+
+    # ── Listing counts (only meaningful if we have a Discord member) ─────────
+    all_listings  = data.get("listings", {})
+    active_count  = 0
+    sold_count    = 0
+    if member:
+        active_count = sum(1 for v in all_listings.values() if v.get("owner_id") == member.id and not v.get("sold"))
+        sold_count   = sum(1 for v in all_listings.values() if v.get("owner_id") == member.id and v.get("sold"))
+
+    # ── Escrow/vouch rating ──────────────────────────────────────────────────
+    vouch_entry = data.get("vouches", {}).get(str(member.id)) if member else None
+
+    # ── Build embed ──────────────────────────────────────────────────────────
+    display = member.display_name if member else query
+    embed   = discord.Embed(title=f"🔍 Profile Lookup — {display}", color=discord.Color.blurple())
+    if member:
+        embed.set_thumbnail(url=member.display_avatar.url)
+
+    if scam_entry:
+        embed.color = discord.Color.red()
+        embed.add_field(
+            name="⚠️ Registry Status",
+            value=(f"🚨 **CONFIRMED SCAMMER**\n"
+                   f"Type: {scam_entry.get('scam_type','?')}  •  Value: {fmt(scam_entry.get('value',0))}\n"
+                   f"Added: {scam_entry.get('added_at','?')[:10]}"),
+            inline=False,
+        )
+    else:
+        embed.add_field(name="✅ Registry Status", value="Clean — not on the Scammer Registry", inline=False)
+
+    if member:
+        embed.add_field(name="📋 Active Listings", value=str(active_count), inline=True)
+        embed.add_field(name="✅ Sold Listings",   value=str(sold_count),   inline=True)
+        if vouch_entry and vouch_entry.get("ratings"):
+            ratings = vouch_entry["ratings"]
+            avg     = sum(r["stars"] for r in ratings) / len(ratings)
+            embed.add_field(
+                name="🤝 Escrow Rating",
+                value=f"{'⭐' * round(avg)} ({avg:.1f}/5)  •  {len(ratings)} rated trades",
+                inline=True,
+            )
+        else:
+            embed.add_field(name="🤝 Escrow Rating", value="No ratings yet", inline=True)
+
+    embed.set_footer(text="SimpleMarketHub | Profile Lookup")
+    await ctx.reply(embed=embed, mention_author=False)
+
+
 @bot.command(name="market_stats")
 async def market_stats(ctx):
     data    = load_data()
